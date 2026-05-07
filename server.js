@@ -11,7 +11,8 @@
  *   ADJACENT                      + MEDIUM  → Groq/Google + vault context
  *   ADJACENT                      + HEAVY   → Google/Groq + vault context
  *   ABSENT   (< 0.50)             + LIGHT   → Groq/Cerebras/Mistral
- *   ABSENT                        + MEDIUM  → Groq/Google/Cerebras
+ *   ABSENT                        + MEDIUM  → Groq/Google/Cerebras/Mistral (Ollama 32b last — slow)
+ * Per-provider timeouts: Ollama 15s, Groq/Cerebras 20s, Mistral 25s, Google 30s, Copilot 45s
  *   ABSENT                        + HEAVY   → Copilot → Google → Groq
  *
  * Port: 4200   Config: ./config.json
@@ -315,7 +316,7 @@ async function getCopilotToken() {
 
 // ─── Provider dispatch ────────────────────────────────────────────────────────
 
-async function dispatchOpenAI({ baseUrl, apiKey, model, body, extraHeaders = {} }) {
+async function dispatchOpenAI({ baseUrl, apiKey, model, body, extraHeaders = {}, timeoutMs = 25000 }) {
   const url     = new URL(`${baseUrl}/chat/completions`);
   const payload = Buffer.from(JSON.stringify({ ...body, model }));
   const lib     = url.protocol === "https:" ? https : http;
@@ -336,7 +337,7 @@ async function dispatchOpenAI({ baseUrl, apiKey, model, body, extraHeaders = {} 
     };
     const req = lib.request(opts, resolve);
     req.on("error", reject);
-    req.setTimeout(60000, () => req.destroy(new Error("timeout")));
+    req.setTimeout(timeoutMs, () => req.destroy(new Error(`timeout after ${timeoutMs}ms`)));
     req.write(payload);
     req.end();
   });
@@ -344,23 +345,23 @@ async function dispatchOpenAI({ baseUrl, apiKey, model, body, extraHeaders = {} 
 
 async function dispatchOllama(model, body) {
   const base = (config.providers.ollama?.baseUrl || "http://127.0.0.1:11434") + "/v1";
-  return dispatchOpenAI({ baseUrl: base, apiKey: "ollama", model, body });
+  return dispatchOpenAI({ baseUrl: base, apiKey: "ollama", model, body, timeoutMs: PROVIDER_TIMEOUTS.ollama });
 }
 async function dispatchGroq(body) {
   const p = config.providers.groq;
-  return dispatchOpenAI({ baseUrl: p.baseUrl, apiKey: p.apiKey, model: p.defaultModel, body });
+  return dispatchOpenAI({ baseUrl: p.baseUrl, apiKey: p.apiKey, model: p.defaultModel, body, timeoutMs: PROVIDER_TIMEOUTS.groq });
 }
 async function dispatchCerebras(body) {
   const p = config.providers.cerebras;
-  return dispatchOpenAI({ baseUrl: p.baseUrl, apiKey: p.apiKey, model: p.defaultModel, body });
+  return dispatchOpenAI({ baseUrl: p.baseUrl, apiKey: p.apiKey, model: p.defaultModel, body, timeoutMs: PROVIDER_TIMEOUTS.cerebras });
 }
 async function dispatchGoogle(body) {
   const p = config.providers.google;
-  return dispatchOpenAI({ baseUrl: p.baseUrl, apiKey: p.apiKey, model: p.defaultModel, body });
+  return dispatchOpenAI({ baseUrl: p.baseUrl, apiKey: p.apiKey, model: p.defaultModel, body, timeoutMs: PROVIDER_TIMEOUTS.google });
 }
 async function dispatchMistral(body) {
   const p = config.providers.mistral;
-  return dispatchOpenAI({ baseUrl: p.baseUrl, apiKey: p.apiKey, model: p.defaultModel, body });
+  return dispatchOpenAI({ baseUrl: p.baseUrl, apiKey: p.apiKey, model: p.defaultModel, body, timeoutMs: PROVIDER_TIMEOUTS.mistral });
 }
 async function dispatchCopilot(body, model = "claude-sonnet-4.6") {
   const token = await getCopilotToken();
@@ -368,6 +369,7 @@ async function dispatchCopilot(body, model = "claude-sonnet-4.6") {
     baseUrl: "https://api.githubcopilot.com",
     apiKey: token, model, body,
     extraHeaders: { "Copilot-Integration-Id": "vscode-chat", "Editor-Version": "vscode/1.95.0" },
+    timeoutMs: PROVIDER_TIMEOUTS.copilot,
   });
 }
 async function dispatchOpenRouter(body, model = "qwen/qwen3-235b-a22b:free") {
@@ -377,6 +379,7 @@ async function dispatchOpenRouter(body, model = "qwen/qwen3-235b-a22b:free") {
     baseUrl: "https://openrouter.ai/api/v1",
     apiKey: p.apiKey, model, body,
     extraHeaders: { "HTTP-Referer": "https://polly-router" },
+    timeoutMs: PROVIDER_TIMEOUTS.openrouter,
   });
 }
 
@@ -447,11 +450,12 @@ async function buildDispatchChain(body, complexity, vaultSignal) {
       chain.push({ name: "mistral",  fn: () => dispatchMistral(body) });
       chain.push({ name: "google",   fn: () => dispatchGoogle(body) });
     } else if (complexity === "MEDIUM") {
-      if (ollamaOk) chain.push({ name: "ollama/qwen2.5-coder:32b", fn: () => dispatchOllama("qwen2.5-coder:32b", body) });
+      // Groq first — fast cloud. Ollama 32b only as fallback (can be slow on complex generation)
       chain.push({ name: "groq",     fn: () => dispatchGroq(body) });
       chain.push({ name: "google",   fn: () => dispatchGoogle(body) });
       chain.push({ name: "cerebras", fn: () => dispatchCerebras(body) });
       chain.push({ name: "mistral",  fn: () => dispatchMistral(body) });
+      if (ollamaOk) chain.push({ name: "ollama/qwen2.5-coder:32b", fn: () => dispatchOllama("qwen2.5-coder:32b", body) });
     } else { // HEAVY + ABSENT — frontier first
       chain.push({ name: "copilot/claude-sonnet-4.6", fn: () => dispatchCopilot(body) });
       chain.push({ name: "google",   fn: () => dispatchGoogle(body) });
@@ -635,6 +639,23 @@ function handleLog(req, res) {
   const limit  = Math.min(parseInt(url.searchParams.get("limit") || "50"), MAX_LOG_ENTRIES);
   const recent = requestLog.slice(-limit).reverse();
   sendJson(res, 200, { total: totalRequests, entries: recent });
+}
+
+// ─── Provider timeouts ─────────────────────────────────────────────────────
+
+const PROVIDER_TIMEOUTS = {
+  "ollama":     15000,  // cap local at 15s — fast models only in default chain
+  "groq":       20000,
+  "cerebras":   20000,
+  "google":     30000,
+  "mistral":    25000,
+  "copilot":    45000,
+  "openrouter": 30000,
+};
+
+function timeoutFor(providerName) {
+  const key = Object.keys(PROVIDER_TIMEOUTS).find(k => providerName.startsWith(k));
+  return key ? PROVIDER_TIMEOUTS[key] : 25000;
 }
 
 // ─── Cost table (USD per 1M tokens) ────────────────────────────────────────
