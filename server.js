@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * polly-router — Phase 3
+ * polly-router — Phase 4
  * Adds QMD vault probe to routing intelligence.
  *
  * Routing decision matrix:
@@ -546,13 +546,44 @@ async function handleCompletions(req, res) {
       if (body.stream) headers["Transfer-Encoding"] = "chunked";
 
       res.writeHead(200, headers);
-      upstream.pipe(res);
-      upstream.on("end", () => log("complete", {
-        provider: attempt.name,
-        complexity,
-        vault: vaultSignal.confidence,
-        ms: Date.now() - startMs,
-      }));
+
+      // Intercept response to capture usage for cost logging
+      if (!body.stream) {
+        // Non-streaming: buffer the full response, parse usage, then forward
+        const chunks = [];
+        upstream.on("data", c => chunks.push(c));
+        upstream.on("end", () => {
+          const raw  = Buffer.concat(chunks);
+          res.end(raw);
+          try {
+            const parsed = JSON.parse(raw.toString());
+            const cost   = estimateCost(attempt.name, parsed.usage);
+            const entry  = {
+              ts:         new Date().toISOString(),
+              provider:   attempt.name,
+              complexity,
+              vault:      vaultSignal.confidence,
+              vaultScore: vaultSignal.score,
+              ms:         Date.now() - startMs,
+              tokens:     parsed.usage || null,
+              cost,
+            };
+            recordRequest(entry);
+            log("complete", { provider: attempt.name, complexity, vault: vaultSignal.confidence, ms: entry.ms, costUsd: cost?.total?.toFixed(6) ?? "0" });
+          } catch {}
+        });
+      } else {
+        upstream.pipe(res);
+        upstream.on("end", () => {
+          const entry = {
+            ts: new Date().toISOString(), provider: attempt.name,
+            complexity, vault: vaultSignal.confidence, vaultScore: vaultSignal.score,
+            ms: Date.now() - startMs, tokens: null, cost: null,
+          };
+          recordRequest(entry);
+          log("complete", { provider: attempt.name, complexity, vault: vaultSignal.confidence, ms: entry.ms });
+        });
+      }
       return;
 
     } catch (e) {
@@ -573,17 +604,86 @@ function handleModels(req, res) {
 }
 
 function handleStatus(req, res) {
+  const providerBreakdown = {};
+  for (const e of requestLog) {
+    const p = e.provider || "unknown";
+    if (!providerBreakdown[p]) providerBreakdown[p] = { calls: 0, costUsd: 0 };
+    providerBreakdown[p].calls++;
+    if (e.cost?.total) providerBreakdown[p].costUsd += e.cost.total;
+  }
+  const vaultHits = requestLog.filter(e => e.vault === "DIRECT" || e.vault === "ADJACENT").length;
+
   sendJson(res, 200, {
-    status: "ok",
-    phase: 3,
-    uptime: process.uptime(),
-    port: PORT,
-    providers: Object.keys(config.providers || {}),
+    status:       "ok",
+    phase:        4,
+    uptime:       process.uptime(),
+    port:         PORT,
+    providers:    Object.keys(config.providers || {}),
     ollamaAvailable: _ollamaOk,
+    stats: {
+      totalRequests,
+      totalCostUsd:    parseFloat(totalCostUsd.toFixed(6)),
+      copilotCalls,
+      vaultHits,
+      providerBreakdown,
+    },
   });
 }
 
-// ─── Server ───────────────────────────────────────────────────────────────────
+function handleLog(req, res) {
+  const url    = new URL(req.url, "http://localhost");
+  const limit  = Math.min(parseInt(url.searchParams.get("limit") || "50"), MAX_LOG_ENTRIES);
+  const recent = requestLog.slice(-limit).reverse();
+  sendJson(res, 200, { total: totalRequests, entries: recent });
+}
+
+// ─── Cost table (USD per 1M tokens) ────────────────────────────────────────
+
+const COST_TABLE = {
+  // Groq
+  "groq":                        { input: 0.59,  output: 0.79 },
+  // Cerebras
+  "cerebras":                    { input: 0.60,  output: 0.60 },
+  // Google AI Studio (free tier — mark as 0)
+  "google":                      { input: 0,     output: 0    },
+  // Mistral Small (free tier)
+  "mistral":                     { input: 0,     output: 0    },
+  // Ollama — local, always free
+  "ollama/qwen2.5:7b":           { input: 0,     output: 0    },
+  "ollama/qwen2.5-coder:32b":    { input: 0,     output: 0    },
+  // Copilot — treat as quota cost, not cash cost; flag with sentinel
+  "copilot/claude-sonnet-4.6":   { input: 3.00,  output: 15.00, quota: true },
+  // OpenRouter free
+  "openrouter":                  { input: 0,     output: 0    },
+};
+
+function estimateCost(providerName, usage) {
+  if (!usage) return null;
+  const key = Object.keys(COST_TABLE).find(k => providerName.startsWith(k));
+  if (!key) return null;
+  const rates = COST_TABLE[key];
+  const inputCost  = ((usage.prompt_tokens     || 0) / 1e6) * rates.input;
+  const outputCost = ((usage.completion_tokens  || 0) / 1e6) * rates.output;
+  return { inputCost, outputCost, total: inputCost + outputCost, quota: !!rates.quota };
+}
+
+// ─── Request log ring buffer ─────────────────────────────────────────────────
+
+const MAX_LOG_ENTRIES = 200;
+const requestLog = [];
+let totalRequests  = 0;
+let totalCostUsd   = 0;
+let copilotCalls   = 0;
+
+function recordRequest(entry) {
+  requestLog.push(entry);
+  if (requestLog.length > MAX_LOG_ENTRIES) requestLog.shift();
+  totalRequests++;
+  if (entry.cost?.total)  totalCostUsd += entry.cost.total;
+  if (entry.provider?.startsWith("copilot")) copilotCalls++;
+}
+
+// ─── Server ─────────────────────────────────────────────────────────────────────
 
 const server = http.createServer(async (req, res) => {
   const { method, url } = req;
@@ -593,6 +693,7 @@ const server = http.createServer(async (req, res) => {
   if (method === "POST" && url === "/v1/chat/completions") return handleCompletions(req, res);
   if (method === "GET"  && url === "/v1/models")           return handleModels(req, res);
   if (method === "GET"  && (url === "/status" || url === "/health")) return handleStatus(req, res);
+  if (method === "GET"  && url.startsWith("/log"))          return handleLog(req, res);
   sendJson(res, 404, { error: { message: "Not found" } });
 });
 
