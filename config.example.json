@@ -1,0 +1,36 @@
+{
+  "_comment": "Copy this to config.json and fill in your keys. config.json is gitignored.",
+  "providers": {
+    "google": {
+      "baseUrl": "https://generativelanguage.googleapis.com/v1beta/openai",
+      "apiKey": "YOUR_GOOGLE_AI_STUDIO_KEY",
+      "defaultModel": "gemini-2.5-flash",
+      "dailyRequestLimit": 1500
+    },
+    "cerebras": {
+      "baseUrl": "https://api.cerebras.ai/v1",
+      "apiKey": "YOUR_CEREBRAS_KEY",
+      "defaultModel": "llama-3.3-70b",
+      "notes": "Groq backup, LPU-style inference"
+    },
+    "mistral": {
+      "baseUrl": "https://api.mistral.ai/v1",
+      "apiKey": "YOUR_MISTRAL_KEY",
+      "defaultModel": "mistral-small-latest",
+      "notes": "Free tier, reliable structured JSON output"
+    },
+    "groq": {
+      "baseUrl": "https://api.groq.com/openai/v1",
+      "apiKey": "YOUR_GROQ_KEY",
+      "defaultModel": "llama-3.3-70b-versatile",
+      "dailyRequestLimit": 100
+    },
+    "ollama": {
+      "baseUrl": "http://127.0.0.1:11434",
+      "notes": "Local — no key required"
+    }
+  },
+  "providers_note": "Tier 1 = free/generous cloud. Add keys as collected.",
+  "phase": 2,
+  "notes": "Phase 2: provider adapters with complexity routing. Phase 3 adds QMD vault probe."
+}
