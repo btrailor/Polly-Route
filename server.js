@@ -1,20 +1,19 @@
 #!/usr/bin/env node
 /**
- * polly-router — Phase 4
- * Adds QMD vault probe to routing intelligence.
+ * polly-router — Phase 5
+ * Context shim: strips OpenClaw system prompt for local models.
+ * Hot model swap: 7b → 32b → 72b based on stripped prompt size.
  *
  * Routing decision matrix:
- *   DIRECT   (vault score ≥ 0.75) + LIGHT   → Ollama small
- *   DIRECT   (vault score ≥ 0.75) + MEDIUM  → Ollama 32b
- *   DIRECT   (vault score ≥ 0.75) + HEAVY   → Ollama 32b (escalate on fail)
- *   ADJACENT (0.50–0.74)          + LIGHT   → Groq/Cerebras/Mistral + vault context
- *   ADJACENT                      + MEDIUM  → Groq/Google + vault context
- *   ADJACENT                      + HEAVY   → Google/Groq + vault context
- *   ABSENT   (< 0.50)             + LIGHT   → Groq/Cerebras/Mistral
- *   ABSENT                        + MEDIUM  → Groq/Google/Cerebras/Mistral (Ollama 32b last — slow)
- * Per-provider timeouts: Ollama 15s, Groq/Cerebras 20s, Mistral 25s, Google 30s, Copilot 45s
+ *   DIRECT   (vault score ≥ 0.75, ≥1 result)
+ *   ADJACENT (0.50–0.74)          + LIGHT   → local (stripped) → Groq → Cerebras → Google
+ *   ADJACENT                      + MEDIUM  → Google → Groq → local (stripped)
+ *   ADJACENT                      + HEAVY   → Google → Groq → Copilot
+ *   ABSENT                        + LIGHT   → Groq → Cerebras → Mistral → Google
+ *   ABSENT                        + MEDIUM  → Groq → Google → Cerebras → Mistral
  *   ABSENT                        + HEAVY   → Copilot → Google → Groq
  *
+ * Context windows (tokens): 7b=8k, 32b=32k, 72b=128k
  * Port: 4200   Config: ./config.json
  */
 
@@ -88,7 +87,7 @@ process.stdin.on('data', d => {
     execFile(
       process.argv[2],
       [process.argv[3], 'query', query, '-c', 'vault', '--no-rerank', '--json'],
-      { timeout: 8000, env: { ...process.env } },
+      { timeout: 12000, env: { ...process.env } },
       (err, stdout) => {
         if (err || !stdout) {
           process.stdout.write(JSON.stringify({ id, error: err?.message || 'no output' }) + '\\n');
@@ -120,9 +119,12 @@ let _workerCbs = {}; // id → { resolve, timer }
 let _reqId = 0;
 let _workerBuf = "";
 
+let _workerReady = false;
+
 function getWorker() {
   if (_worker && !_worker.killed) return _worker;
   log("starting QMD worker");
+  _workerReady = false;
   _worker = spawn(NODE_BIN, [WORKER_PATH, NODE_BIN, QMD_JS], {
     stdio: ["pipe", "pipe", "pipe"],
     env: { ...process.env },
@@ -137,6 +139,11 @@ function getWorker() {
       if (!line.trim()) continue;
       try {
         const msg = JSON.parse(line);
+        // Mark worker ready on first response (warmup or real)
+        if (!_workerReady) {
+          _workerReady = true;
+          log("QMD worker ready");
+        }
         const cb  = _workerCbs[msg.id];
         if (cb) { clearTimeout(cb.timer); delete _workerCbs[msg.id]; cb.resolve(msg); }
       } catch {}
@@ -146,6 +153,7 @@ function getWorker() {
   _worker.on("exit", (code) => {
     log("QMD worker exited", { code });
     _worker = null;
+    _workerReady = false;
     // Reject any pending callbacks
     for (const [id, cb] of Object.entries(_workerCbs)) {
       clearTimeout(cb.timer);
@@ -155,10 +163,17 @@ function getWorker() {
     // Restart after 1s
     setTimeout(getWorker, 1000);
   });
-  // Warm up: send a dummy query so models load now
+  // Warm up: send a real query so models load and _workerReady flips
   setTimeout(() => {
     const warmId = "warm_" + Date.now();
-    _worker.stdin.write(JSON.stringify({ id: warmId, query: "polly router" }) + "\n");
+    _workerCbs[warmId] = {
+      timer: setTimeout(() => { delete _workerCbs[warmId]; }, 30000),
+      resolve: (msg) => {
+        delete _workerCbs[warmId];
+        if (!_workerReady) { _workerReady = true; log("QMD worker ready (warmup)"); }
+      },
+    };
+    _worker.stdin.write(JSON.stringify({ id: warmId, query: "polly router routing logic" }) + "\n");
   }, 500);
   return _worker;
 }
@@ -195,7 +210,7 @@ function probeVault(userMessage) {
         const chunks   = results.slice(0, 3).map(r => r.snippet || "").filter(Boolean);
 
         let confidence;
-        if (topScore >= 0.75 && results.length >= 2 && totalLen >= 300) confidence = "DIRECT";
+        if (topScore >= 0.75 && results.length >= 1) confidence = "DIRECT";
         else if (topScore >= 0.50) confidence = "ADJACENT";
         else confidence = "ABSENT";
 
@@ -272,6 +287,135 @@ function injectVaultContext(body, chunks) {
       ...messages.slice(insertAt),
     ],
   };
+}
+
+// ─── Context shim for local models ─────────────────────────────────────────
+
+/**
+ * Local model context windows (chars, ~4 chars/token).
+ * Used for hot-swap selection.
+ */
+const LOCAL_MODELS = [
+  { name: "qwen2.5:7b",         maxChars:  28000,  weight: "light"  },
+  { name: "qwen2.5-coder:32b",  maxChars: 112000,  weight: "medium" },
+  { name: "qwen2.5:72b",        maxChars: 480000,  weight: "heavy"  },
+];
+
+/**
+ * Estimate chars in a messages array.
+ */
+function estimateChars(messages) {
+  return (messages || []).reduce((n, m) => {
+    const c = m.content || "";
+    return n + (Array.isArray(c) ? c.map(x => x.text || "").join("").length : c.length);
+  }, 0);
+}
+
+/**
+ * Smart context shim for local models.
+ *
+ * OpenClaw system prompt injection order (confirmed):
+ *   AGENTS.md → SOUL.md → TOOLS.md → IDENTITY.md → USER.md → HEARTBEAT.md → MEMORY.md
+ *   followed by skills list (<available_skills>), tool schemas (JSON), then
+ *   OPENCLAW_CACHE_BOUNDARY, dynamic project context.
+ *
+ * We keep: SOUL.md block + IDENTITY.md block + vault chunks
+ * We discard: AGENTS.md, TOOLS.md, USER.md, HEARTBEAT.md, MEMORY.md,
+ *             tool schemas, skills list, dynamic context
+ */
+function stripForLocal(body, vaultChunks = []) {
+  const messages = (body.messages || []).slice();
+  const stripped = [];
+
+  // Tools are already filtered by OpenClaw per-agent config before reaching polly-router.
+  // Pass them through unchanged to local models.
+  const filteredTools = body.tools;
+
+  for (const msg of messages) {
+    if (msg.role !== "system") {
+      stripped.push(msg);
+      continue;
+    }
+
+    const raw = Array.isArray(msg.content)
+      ? msg.content.map(c => c.text || "").join("")
+      : (msg.content || "");
+
+    let text = raw;
+
+    // --- Strip everything after OPENCLAW_CACHE_BOUNDARY (dynamic context) ---
+    const cacheIdx = text.indexOf("OPENCLAW_CACHE_BOUNDARY");
+    if (cacheIdx !== -1) text = text.slice(0, cacheIdx);
+
+    // --- Strip <available_skills> block ---
+    text = text.replace(/<available_skills>[\s\S]*?<\/available_skills>/g, "");
+
+    // --- Strip tool JSON schemas (large JSON blocks with 'parameters'/'properties') ---
+    text = text.replace(/\{[\s\S]{500,}?\}/g, (match) => {
+      if (match.includes('"parameters"') || match.includes('"properties"') || match.includes('"description"')) return "";
+      return match;
+    });
+
+    // --- Extract SOUL.md block ---
+    // Matches: ## /path/SOUL.md ... next ## /path/XXX.md section
+    let soul = "";
+    const soulMatch = text.match(/##\s+\/[^\n]*SOUL\.md[\s\S]*?(?=##\s+\/[^\n]*\.md|$)/);
+    if (soulMatch) {
+      soul = soulMatch[0].trim();
+    } else {
+      // Fallback: look for # SOUL.md header
+      const soulHeader = text.match(/#+ SOUL\.md[\s\S]*?(?=#+\s+\S+\.md|<available_skills|$)/);
+      if (soulHeader) soul = soulHeader[0].trim();
+    }
+
+    // --- Extract IDENTITY.md block ---
+    let identity = "";
+    const identMatch = text.match(/##\s+\/[^\n]*IDENTITY\.md[\s\S]*?(?=##\s+\/[^\n]*\.md|$)/);
+    if (identMatch) {
+      identity = identMatch[0].trim();
+    } else {
+      const identHeader = text.match(/#+ IDENTITY\.md[\s\S]*?(?=#+\s+\S+\.md|<available_skills|$)/);
+      if (identHeader) identity = identHeader[0].trim();
+    }
+
+    // --- Build minimal system prompt ---
+    // Local models are RAG answer engines only — no persona, no orchestration identity.
+    // Just a neutral instruction + vault context.
+    const parts = [];
+    parts.push("You are a helpful assistant. Answer the user's question accurately and concisely.");
+
+    if (vaultChunks.length) {
+      const vaultCtx = vaultChunks.map((c, i) => `[Vault ${i+1}]\n${c}`).join("\n\n");
+      parts.push(`## Relevant vault context\n${vaultCtx}`);
+    }
+
+    parts.push("Answer concisely using the vault context above where relevant.");
+
+    stripped.push({ role: "system", content: parts.join("\n\n") });
+    log("shim", { soulStripped: true, partsChars: parts.join("\n\n").length });
+  }
+
+  return { ...body, messages: stripped, tools: filteredTools?.length ? filteredTools : undefined, tool_choice: filteredTools?.length ? body.tool_choice : undefined };
+}
+
+/**
+ * For DIRECT vault hits, enforce a minimum of 32b (capable enough to synthesize vault content).
+ * Returns model name, or null if no local model is large enough.
+ */
+function selectLocalModel(body, preferWeight = null, minWeight = null) {
+  const chars = estimateChars(body.messages);
+  // Add 20% headroom for response tokens
+  const needed = Math.ceil(chars * 1.2);
+  const weightOrder = ["light", "medium", "heavy"];
+  const minIdx = minWeight ? weightOrder.indexOf(minWeight) : 0;
+  const candidates = LOCAL_MODELS.filter(m => m.maxChars >= needed && weightOrder.indexOf(m.weight) >= minIdx);
+  if (!candidates.length) return null;
+  // If a preference is given, try to honour it
+  if (preferWeight) {
+    const preferred = candidates.find(m => m.weight === preferWeight);
+    if (preferred) return preferred.name;
+  }
+  return candidates[0].name; // smallest that fits
 }
 
 // ─── Copilot OAuth ────────────────────────────────────────────────────────────
@@ -407,59 +551,77 @@ async function buildDispatchChain(body, complexity, vaultSignal) {
   const { confidence, chunks } = vaultSignal;
   const ollamaOk = await isOllamaAvailable();
 
-  // Inject vault context for DIRECT/ADJACENT
+  // Detect main/orchestrator agent — force cloud only.
+  // Signals: >20 tools (main has 60+, all others are tightly scoped)
+  // or IDENTITY.md contains 'main' agent marker.
+  const toolCount = (body.tools || []).length;
+  const isOrchestratorAgent = toolCount > 20;
+  if (isOrchestratorAgent) {
+    log("routing-note", { reason: "orchestrator agent — cloud only", tools: toolCount });
+  }
+
+  // Build enriched body (vault context injected) for cloud routes
   const enriched = (confidence !== "ABSENT" && chunks.length)
     ? injectVaultContext(body, chunks)
     : body;
 
+  // Build stripped body for local routes — minimal context, persona + vault only
+  const strippedBody = stripForLocal(body, confidence !== "ABSENT" ? chunks : []);
+  // DIRECT: minimum 32b for quality; ADJACENT/ABSENT LIGHT: any model fine
+  // Orchestrator agents never route local
+  const directLocalModel   = (ollamaOk && !isOrchestratorAgent) ? selectLocalModel(strippedBody, null, "medium") : null;
+  const adjacentLocalModel = (ollamaOk && !isOrchestratorAgent) ? selectLocalModel(strippedBody) : null;
+
+  log("context", {
+    fullChars: estimateChars(body.messages),
+    strippedChars: estimateChars(strippedBody.messages),
+    localModel: (directLocalModel || adjacentLocalModel) || "none (too large or unavailable)",
+  });
+
   const chain = [];
 
   if (confidence === "DIRECT") {
-    // Vault has the answer — local first regardless of complexity
-    if (ollamaOk) {
-      const model = complexity === "LIGHT" ? "qwen2.5:7b" : "qwen2.5-coder:32b";
-      chain.push({ name: `ollama/${model}`, fn: () => dispatchOllama(model, enriched) });
+    // Vault has the answer — local first with stripped context, hot-swap to fit
+    if (directLocalModel) {
+      chain.push({ name: `ollama/${directLocalModel}`, fn: () => dispatchOllama(directLocalModel, strippedBody) });
     }
-    chain.push({ name: "groq",     fn: () => dispatchGroq(enriched) });
     chain.push({ name: "google",   fn: () => dispatchGoogle(enriched) });
+    chain.push({ name: "groq",     fn: () => dispatchGroq(enriched) });
     chain.push({ name: "cerebras", fn: () => dispatchCerebras(enriched) });
+    chain.push({ name: "copilot/claude-sonnet-4.6", fn: () => dispatchCopilot(enriched) });
 
   } else if (confidence === "ADJACENT") {
     if (complexity === "LIGHT") {
-      if (ollamaOk) chain.push({ name: "ollama/qwen2.5:7b", fn: () => dispatchOllama("qwen2.5:7b", enriched) });
+      if (adjacentLocalModel) chain.push({ name: `ollama/${adjacentLocalModel}`, fn: () => dispatchOllama(adjacentLocalModel, strippedBody) });
       chain.push({ name: "groq",     fn: () => dispatchGroq(enriched) });
       chain.push({ name: "cerebras", fn: () => dispatchCerebras(enriched) });
       chain.push({ name: "mistral",  fn: () => dispatchMistral(enriched) });
       chain.push({ name: "google",   fn: () => dispatchGoogle(enriched) });
     } else if (complexity === "MEDIUM") {
-      chain.push({ name: "groq",   fn: () => dispatchGroq(enriched) });
       chain.push({ name: "google", fn: () => dispatchGoogle(enriched) });
-      if (ollamaOk) chain.push({ name: "ollama/qwen2.5-coder:32b", fn: () => dispatchOllama("qwen2.5-coder:32b", enriched) });
+      chain.push({ name: "groq",   fn: () => dispatchGroq(enriched) });
+      if (adjacentLocalModel) chain.push({ name: `ollama/${adjacentLocalModel}`, fn: () => dispatchOllama(adjacentLocalModel, strippedBody) });
       chain.push({ name: "cerebras", fn: () => dispatchCerebras(enriched) });
     } else { // HEAVY
-      chain.push({ name: "google", fn: () => dispatchGoogle(enriched) });
-      chain.push({ name: "groq",   fn: () => dispatchGroq(enriched) });
-      if (ollamaOk) chain.push({ name: "ollama/qwen2.5-coder:32b", fn: () => dispatchOllama("qwen2.5-coder:32b", enriched) });
+      chain.push({ name: "google",   fn: () => dispatchGoogle(enriched) });
+      chain.push({ name: "groq",     fn: () => dispatchGroq(enriched) });
+      chain.push({ name: "copilot/claude-sonnet-4.6", fn: () => dispatchCopilot(enriched) });
     }
 
   } else { // ABSENT
     if (complexity === "LIGHT") {
-      if (ollamaOk) chain.push({ name: "ollama/qwen2.5:7b", fn: () => dispatchOllama("qwen2.5:7b", body) });
       chain.push({ name: "groq",     fn: () => dispatchGroq(body) });
       chain.push({ name: "cerebras", fn: () => dispatchCerebras(body) });
       chain.push({ name: "mistral",  fn: () => dispatchMistral(body) });
       chain.push({ name: "google",   fn: () => dispatchGoogle(body) });
     } else if (complexity === "MEDIUM") {
-      // Groq first — fast cloud. Ollama 32b only as fallback (can be slow on complex generation)
       chain.push({ name: "groq",     fn: () => dispatchGroq(body) });
       chain.push({ name: "google",   fn: () => dispatchGoogle(body) });
       chain.push({ name: "cerebras", fn: () => dispatchCerebras(body) });
       chain.push({ name: "mistral",  fn: () => dispatchMistral(body) });
-      if (ollamaOk) chain.push({ name: "ollama/qwen2.5-coder:32b", fn: () => dispatchOllama("qwen2.5-coder:32b", body) });
     } else { // HEAVY + ABSENT — frontier first
       chain.push({ name: "copilot/claude-sonnet-4.6", fn: () => dispatchCopilot(body) });
       chain.push({ name: "google",   fn: () => dispatchGoogle(body) });
-      if (ollamaOk) chain.push({ name: "ollama/qwen2.5-coder:32b", fn: () => dispatchOllama("qwen2.5-coder:32b", body) });
       chain.push({ name: "groq",     fn: () => dispatchGroq(body) });
     }
   }
@@ -502,13 +664,14 @@ async function handleCompletions(req, res) {
 
   // Fire vault probe async — don't block routing on it
   // We'll use it to influence the chain for the NEXT tier decision.
-  // For inline context injection we use a 2s race.
+  // For inline context injection we use a race — longer if worker is still warming up.
   const vaultPromise = probeVault(userMsg);
 
-  // Give vault probe up to 2s before we route without it
+  // Give vault probe up to 5s (warm) or 15s (cold boot) before routing without it
+  const probeRaceMs = _workerReady ? 5000 : 15000;
   const vaultSignal = await Promise.race([
     vaultPromise,
-    new Promise(r => setTimeout(() => r({ confidence: "ABSENT", score: 0, chunks: [] }), 2000)),
+    new Promise(r => setTimeout(() => r({ confidence: "ABSENT", score: 0, chunks: [] }), probeRaceMs)),
   ]);
 
   const chain   = await buildDispatchChain(body, complexity, vaultSignal);
@@ -644,7 +807,7 @@ function handleLog(req, res) {
 // ─── Provider timeouts ─────────────────────────────────────────────────────
 
 const PROVIDER_TIMEOUTS = {
-  "ollama":     15000,  // cap local at 15s — fast models only in default chain
+  "ollama":     120000, // 120s — 32b/72b generation can take 60-90s on M4 Max
   "groq":       20000,
   "cerebras":   20000,
   "google":     30000,
