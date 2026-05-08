@@ -1,0 +1,22 @@
+{
+  "ollama": {
+    "baseUrl": "http://127.0.0.1:11434",
+    "models": [
+      { "id": "qwen2.5:7b",        "name": "Qwen 2.5 7B",        "maxChars":  28000, "weight": "light"  },
+      { "id": "qwen2.5-coder:32b", "name": "Qwen 2.5 Coder 32B", "maxChars": 112000, "weight": "medium" },
+      { "id": "qwen2.5:72b",       "name": "Qwen 2.5 72B",       "maxChars": 480000, "weight": "heavy"  }
+    ]
+  },
+  "providers": {
+    "groq":       { "baseUrl": "https://api.groq.com/openai/v1",                                "apiKey": "YOUR_GROQ_KEY",      "defaultModel": "llama-3.3-70b-versatile" },
+    "cerebras":   { "baseUrl": "https://api.cerebras.ai/v1",                                     "apiKey": "YOUR_CEREBRAS_KEY",  "defaultModel": "llama-3.3-70b" },
+    "google":     { "baseUrl": "https://generativelanguage.googleapis.com/v1beta/openai",         "apiKey": "YOUR_GOOGLE_KEY",    "defaultModel": "gemini-2.5-flash" },
+    "mistral":    { "baseUrl": "https://api.mistral.ai/v1",                                      "apiKey": "YOUR_MISTRAL_KEY",   "defaultModel": "mistral-small-latest" },
+    "openrouter": { "baseUrl": "https://openrouter.ai/api/v1",                                    "apiKey": "YOUR_OPENROUTER_KEY","defaultModel": "qwen/qwen3-235b-a22b:free" }
+  },
+  "qmd": {
+    "baseUrl": "http://localhost:8181",
+    "collection": "vault",
+    "timeoutMs": 500
+  }
+}

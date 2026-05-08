@@ -1,13 +1,6 @@
-# Secrets — never commit
-config.json
-*.env
-.env*
-*.key
-*.pem
-secrets/
-secrets.json
-
-# Runtime
 node_modules/
-*.log
-.router-state.json
+dist/
+polly-router.config.json
+*.env
+.DS_Store
+config.json
