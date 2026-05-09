@@ -51,9 +51,10 @@ function rewriteTextToolCall(raw: string): string {
       if (hasToolCalls || !content || typeof content !== 'string') continue;
 
       // Try to parse content as a tool call
-      // Handles two formats:
-      // 1. {"name": "tool", "arguments": {...}}  (standard)
+      // Handles three formats:
+      // 1. {"name": "tool", "arguments": {...}}  (standard JSON)
       // 2. tool_name {"arg": ...}                (Qwen bare format)
+      // 3. prose text followed by JSON tool call  (Qwen mixed format)
       let toolCall: any;
       const trimmed = content.trim();
       try {
@@ -64,8 +65,16 @@ function rewriteTextToolCall(raw: string): string {
         if (bareMatch) {
           try {
             toolCall = { name: bareMatch[1], arguments: JSON.parse(bareMatch[2]) };
-          } catch { continue; }
-        } else { continue; }
+          } catch { /* fall through */ }
+        }
+        // Try mixed format: prose + JSON tool call at end
+        if (!toolCall) {
+          const jsonMatch = trimmed.match(/\{\s*"name"\s*:\s*"(\w+)"[\s\S]*\}(?=[^\}]*$)/);
+          if (jsonMatch) {
+            try { toolCall = JSON.parse(jsonMatch[0]); } catch { /* fall through */ }
+          }
+        }
+        if (!toolCall) continue;
       }
 
       if (typeof toolCall?.name !== 'string' || !toolCall.name) continue;
