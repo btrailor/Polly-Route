@@ -10,9 +10,24 @@ function log(msg: string, meta?: object) {
 function getLastUserText(messages: Message[]): string {
   const last = [...messages].reverse().find(m => m.role === 'user');
   if (!last) return '';
-  if (typeof last.content === 'string') return last.content;
-  if (Array.isArray(last.content)) return last.content.map((c: any) => c.text ?? '').join(' ');
-  return '';
+  const text = typeof last.content === 'string'
+    ? last.content
+    : Array.isArray(last.content) ? last.content.map((c: any) => c.text ?? '').join(' ') : '';
+
+  // Subagent runtime headers are not meaningful vault queries.
+  // Detect by checking if the last user message is an OpenClaw runtime preamble
+  // (contains subagent depth markers). If so, fall back to the system prompt.
+  const isRuntimeHeader = /subagent.*depth|\[Subagent Context\]|you are running as a subagent/i.test(text);
+  if (isRuntimeHeader) {
+    const sys = messages.find(m => m.role === 'system');
+    if (sys) {
+      const sysText = typeof sys.content === 'string' ? sys.content : '';
+      // Extract meaningful text: skip boilerplate sections, grab first 300 chars of substance
+      const stripped = sysText.replace(/##.*?\n/g, '').replace(/^[-*].*?\n/gm, '').trim();
+      return stripped.slice(0, 300);
+    }
+  }
+  return text;
 }
 
 export async function probeVault(messages: Message[], config: Config): Promise<VaultSignal> {

@@ -19,8 +19,14 @@ export function googleAdapter(cfg: ProviderConfig) {
 }
 
 export function mistralAdapter(cfg: ProviderConfig) {
-  return (body: RequestBody): Promise<http.IncomingMessage> =>
-    dispatchOpenAI(cfg.baseUrl, cfg.apiKey ?? '', cfg.defaultModel ?? 'mistral-small-latest', body, { timeoutMs: 25000 });
+  return (body: RequestBody): Promise<http.IncomingMessage> => {
+    // Mistral rejects max_completion_tokens — remap to max_tokens
+    const { max_completion_tokens, ...rest } = body as any;
+    const mistralBody: RequestBody = max_completion_tokens
+      ? { ...rest, max_tokens: max_completion_tokens }
+      : rest;
+    return dispatchOpenAI(cfg.baseUrl, cfg.apiKey ?? '', cfg.defaultModel ?? 'mistral-small-latest', mistralBody, { timeoutMs: 25000 });
+  };
 }
 
 export function openrouterAdapter(cfg: ProviderConfig) {
