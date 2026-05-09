@@ -79,6 +79,13 @@ export function estimateTokens(value: unknown): number {
   return Math.ceil(JSON.stringify(value).length / 4);
 }
 
+/** Normalise message content to a plain string regardless of format. */
+function contentToString(content: unknown): string {
+  if (typeof content === 'string') return content;
+  if (Array.isArray(content)) return (content as Array<{text?: string}>).map(p => p.text ?? '').join('');
+  return '';
+}
+
 // ---------------------------------------------------------------------------
 // Tool schema reduction (I1, I2, I6)
 // ---------------------------------------------------------------------------
@@ -253,7 +260,7 @@ export function contractTranslate(
     if (m.role === 'system') {
       return {
         ...m,
-        content: rewriteSystemPrompt(m.content as string, keptTools, removedTools),
+        content: rewriteSystemPrompt(contentToString(m.content), keptTools, removedTools),
       };
     }
     return m;

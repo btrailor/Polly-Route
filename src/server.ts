@@ -87,6 +87,7 @@ async function handleCompletions(req: http.IncomingMessage, res: http.ServerResp
     return sendJson(res, 400, { error: { message: 'Invalid JSON' } });
   }
 
+
   const complexity  = classifyComplexity(body.messages ?? []);
   const userMsg     = getLastUserMessage(body.messages ?? []);
   const vaultSignal = await probeVault(body.messages ?? [], config);
@@ -128,14 +129,13 @@ async function handleCompletions(req: http.IncomingMessage, res: http.ServerResp
 
       // Step 1 diagnostic: log exact body sent to local model
       if (isLocal) {
-        log('local-dispatch-body', {
+  log('local-dispatch-body', {
           provider: entry.name,
           systemPromptLength: (dispatchBody.messages?.find((m: any) => m.role === 'system')?.content as string ?? '').length,
-          systemPromptPreview: (dispatchBody.messages?.find((m: any) => m.role === 'system')?.content as string ?? '').slice(0, 500),
+          systemPromptPreview: (dispatchBody.messages?.find((m: any) => m.role === 'system')?.content as string ?? '').slice(0, 200),
           toolCount: dispatchBody.tools?.length ?? 0,
           toolNames: (dispatchBody.tools ?? []).map((t: any) => t.function?.name),
           messageCount: dispatchBody.messages?.length ?? 0,
-          vaultChunksPresent: dispatchBody.messages?.some((m: any) => typeof m.content === 'string' && m.content.includes('vault')),
         });
       }
 
