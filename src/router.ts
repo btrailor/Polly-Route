@@ -60,7 +60,7 @@ export async function buildChain(
 
   const push = (name: string, fn: ChainEntry['fn'] | null) => { if (fn) chain.push({ name, fn }); };
   const pushOllama = (model: ReturnType<OllamaAdapter['pickModel']>, b: RequestBody) => {
-    if (model) chain.push({ name: `ollama/${model.id}`, fn: () => ollama.dispatch(model, b) });
+    if (model) chain.push({ name: `ollama/${model.id}`, fn: (dispatchBody: RequestBody) => ollama.dispatch(model, dispatchBody) });
   };
 
   if (vault.confidence === 'DIRECT') {
