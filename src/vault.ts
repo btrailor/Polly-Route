@@ -16,16 +16,17 @@ function getLastUserText(messages: Message[]): string {
 }
 
 export async function probeVault(messages: Message[], config: Config): Promise<VaultSignal> {
-  const query = getLastUserText(messages).slice(0, 300).replace(/\n/g, ' ');
+  const query = getLastUserText(messages).slice(0, 300).replace(/\n/g, ' ').replace(/-/g, ' ');
   if (!query) return { confidence: 'ABSENT', score: 0, chunks: [] };
+  log('vault probe query', { query, timeoutMs: config.qmd.timeoutMs, url: config.qmd.baseUrl });
 
   const body = JSON.stringify({
     searches: [
-      { type: 'lex', query },
       { type: 'vec', query },
     ],
     collections: [config.qmd.collection],
     limit: 5,
+    minScore: config.qmd.minScore ?? 0.89,
   });
 
   return new Promise((resolve) => {
@@ -57,8 +58,8 @@ export async function probeVault(messages: Message[], config: Config): Promise<V
             .filter(Boolean);
 
           let confidence: VaultSignal['confidence'];
-          if (topScore >= 0.75 && results.length >= 1) confidence = 'DIRECT';
-          else if (topScore >= 0.50) confidence = 'ADJACENT';
+          if (topScore >= 0.92 && results.length >= 1) confidence = 'DIRECT';
+          else if (topScore >= 0.89) confidence = 'ADJACENT';
           else confidence = 'ABSENT';
 
           resolve({ confidence, score: topScore, chunks: vaultChunks });

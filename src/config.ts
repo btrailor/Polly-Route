@@ -31,6 +31,7 @@ export interface Config {
     baseUrl: string;
     collection: string;
     timeoutMs: number;
+    minScore: number;
   };
 }
 
@@ -62,6 +63,7 @@ export function loadConfig(): Config {
       baseUrl: raw.qmd?.baseUrl ?? 'http://localhost:8181',
       collection: raw.qmd?.collection ?? 'vault',
       timeoutMs: raw.qmd?.timeoutMs ?? 500,
+      minScore: raw.qmd?.minScore ?? 0.89,
     },
   };
 }

@@ -19,7 +19,7 @@ const TEST_CONFIG: Config = {
     google:   { baseUrl: 'https://generativelanguage.googleapis.com/v1beta/openai', apiKey: 'test-google', defaultModel: 'gemini-2.5-flash' },
     mistral:  { baseUrl: 'https://api.mistral.ai/v1',           apiKey: 'test-mistral',  defaultModel: 'mistral-small-latest' },
   },
-  qmd: { baseUrl: 'http://localhost:8181', collection: 'vault', timeoutMs: 500 },
+  qmd: { baseUrl: 'http://localhost:8181', collection: 'vault', timeoutMs: 500, minScore: 0.89 },
 };
 
 // Small body — fits in 7b
