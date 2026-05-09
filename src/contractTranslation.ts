@@ -134,11 +134,19 @@ export function rewriteSystemPrompt(
   keptTools: Tool[],
   removedTools: string[],
 ): string {
+  // Strip OpenClaw subagent runtime boilerplate before processing.
+  // ## Session Context and ## Runtime are injected by the harness for cloud models
+  // but are noise for local models (~6KB of metadata irrelevant to the task).
+  // ## Your Role contains the actual task — preserve it.
+  const stripped = systemContent
+    .replace(/\n## Session Context\n[\s\S]*?(?=\n## |$)/g, '')
+    .replace(/\n## Runtime\n[\s\S]*?(?=\n## |$)/g, '');
+
   // Remove any previous polly tools section
-  const markerIndex = systemContent.indexOf(TOOLS_SECTION_MARKER);
+  const markerIndex = stripped.indexOf(TOOLS_SECTION_MARKER);
   const base = markerIndex >= 0
-    ? systemContent.slice(0, markerIndex).trimEnd()
-    : systemContent.trimEnd();
+    ? stripped.slice(0, markerIndex).trimEnd()
+    : stripped.trimEnd();
 
   if (keptTools.length === 0) {
     return base + `\n\n${TOOLS_SECTION_MARKER}\nYou have no tools available in this context.`;

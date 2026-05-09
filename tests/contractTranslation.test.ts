@@ -325,3 +325,52 @@ describe('DEFAULT_LOCAL_SURFACE', () => {
     expect(DEFAULT_LOCAL_SURFACE).toContain('memory_get');
   });
 });
+
+// ─── Runtime boilerplate stripping ───────────────────────────────────────────────────────────────────────────────
+describe('runtime boilerplate stripping', () => {
+  const soul = 'You are The Cartographer.\n\nYour job is wayfinding.';
+  const runtime = [
+    '## Session Context',
+    '- Label: vault-scout',
+    '- Requester session: agent:main:subagent:abc123',
+    '## Runtime',
+    'Runtime: agent=the-cartographer | host=Mac Studio | model=polly-router/auto',
+    '## Your Role',
+    '- You were created to handle the following task:',
+    '',
+    'Search the vault for polly router.',
+  ].join('\n');
+  const systemContent = soul + '\n' + runtime;
+  const tools = [
+    { type: 'function' as const, function: { name: 'memory_search', description: '', parameters: {} } },
+  ];
+  const messages: Message[] = [{ role: 'system', content: systemContent }, { role: 'user', content: 'go' }];
+
+  test('strips ## Session Context from local dispatch', () => {
+    const result = contractTranslate(messages, tools, { localSurface: DEFAULT_LOCAL_SURFACE, maxTokens: 8000 });
+    const sys = result.messages.find(m => m.role === 'system')?.content as string;
+    expect(sys).not.toContain('## Session Context');
+    expect(sys).not.toContain('Requester session');
+  });
+
+  test('strips ## Runtime from local dispatch', () => {
+    const result = contractTranslate(messages, tools, { localSurface: DEFAULT_LOCAL_SURFACE, maxTokens: 8000 });
+    const sys = result.messages.find(m => m.role === 'system')?.content as string;
+    expect(sys).not.toContain('## Runtime');
+    expect(sys).not.toContain('host=Mac Studio');
+  });
+
+  test('preserves ## Your Role (task) after stripping', () => {
+    const result = contractTranslate(messages, tools, { localSurface: DEFAULT_LOCAL_SURFACE, maxTokens: 8000 });
+    const sys = result.messages.find(m => m.role === 'system')?.content as string;
+    expect(sys).toContain('## Your Role');
+    expect(sys).toContain('Search the vault for polly router');
+  });
+
+  test('preserves agent SOUL after stripping', () => {
+    const result = contractTranslate(messages, tools, { localSurface: DEFAULT_LOCAL_SURFACE, maxTokens: 8000 });
+    const sys = result.messages.find(m => m.role === 'system')?.content as string;
+    expect(sys).toContain('You are The Cartographer');
+    expect(sys).toContain('wayfinding');
+  });
+});
