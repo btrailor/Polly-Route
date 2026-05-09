@@ -58,12 +58,6 @@ export interface TranslationResult {
  *   - image_generate / video_generate / tts / music_generate: group:ui
  *   - sessions_*: group:sessions, orchestration
  *   - gateway / nodes: admin/device tools, explicitly denied by all agents
- *
- * Included QMD tools (qmd__query, qmd__get, qmd__multi_get, qmd__status):
- *   These are vault search tools registered via QMD MCP server.
- *   Vault-primary agents (cartographer, archivist) depend on these.
- *   Local routing is triggered by vault relevance — stripping vault search
- *   tools on the local path would be self-defeating.
  */
 export const DEFAULT_LOCAL_SURFACE: string[] = [
   'memory_search',
@@ -71,13 +65,6 @@ export const DEFAULT_LOCAL_SURFACE: string[] = [
   'update_plan',
   'read',
   'write',
-  // QMD vault search tools (registered via MCP server 'qmd')
-  // These are the primary tools for vault-primary agents (cartographer, archivist)
-  // and must survive contract translation when routing local.
-  'qmd__query',
-  'qmd__get',
-  'qmd__multi_get',
-  'qmd__status',
 ];
 
 // ---------------------------------------------------------------------------
