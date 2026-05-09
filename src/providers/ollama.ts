@@ -20,11 +20,14 @@ export class OllamaAdapter {
   }
 
   async dispatch(model: OllamaModel, body: RequestBody): Promise<http.IncomingMessage> {
+    // Always request non-streaming from Ollama so server.ts can buffer,
+    // rewrite text-format tool calls, and re-emit as SSE if the client wants it.
+    const nonStreamBody = { ...body, stream: false };
     return dispatchOpenAI(
       `${this.baseUrl}/v1`,
       'ollama',
       model.id,
-      body,
+      nonStreamBody,
       { timeoutMs: 120000 }
     );
   }
