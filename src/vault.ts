@@ -22,7 +22,12 @@ function getLastUserText(messages: Message[]): string {
     const sys = messages.find(m => m.role === 'system');
     if (sys) {
       const sysText = typeof sys.content === 'string' ? sys.content : '';
-      // Extract meaningful text: skip boilerplate sections, grab first 300 chars of substance
+      // Prefer ## Your Role content — that's the actual task, most relevant for vault probe
+      const yourRoleMatch = sysText.match(/## Your Role[\s\S]*?(?:task[^\n]*:\s*```?\n?([\s\S]*?)(?:```|\n##|$))/i);
+      if (yourRoleMatch?.[1]) {
+        return yourRoleMatch[1].trim().slice(0, 300);
+      }
+      // Fallback: grab first 300 chars of substance after stripping boilerplate headings
       const stripped = sysText.replace(/##.*?\n/g, '').replace(/^[-*].*?\n/gm, '').trim();
       return stripped.slice(0, 300);
     }
