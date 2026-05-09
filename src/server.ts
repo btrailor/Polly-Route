@@ -51,10 +51,22 @@ function rewriteTextToolCall(raw: string): string {
       if (hasToolCalls || !content || typeof content !== 'string') continue;
 
       // Try to parse content as a tool call
+      // Handles two formats:
+      // 1. {"name": "tool", "arguments": {...}}  (standard)
+      // 2. tool_name {"arg": ...}                (Qwen bare format)
       let toolCall: any;
+      const trimmed = content.trim();
       try {
-        toolCall = JSON.parse(content.trim());
-      } catch { continue; }
+        toolCall = JSON.parse(trimmed);
+      } catch {
+        // Try bare format: "tool_name {...}"
+        const bareMatch = trimmed.match(/^(\w+)\s+(\{[\s\S]*\})$/);
+        if (bareMatch) {
+          try {
+            toolCall = { name: bareMatch[1], arguments: JSON.parse(bareMatch[2]) };
+          } catch { continue; }
+        } else { continue; }
+      }
 
       if (typeof toolCall?.name !== 'string' || !toolCall.name) continue;
 
