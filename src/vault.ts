@@ -23,7 +23,7 @@ function getLastUserText(messages: Message[]): string {
     if (sys) {
       const sysText = typeof sys.content === 'string' ? sys.content : '';
       // Prefer ## Your Role content — that's the actual task, most relevant for vault probe
-      const yourRoleMatch = sysText.match(/## Your Role[\s\S]*?(?:task[^\n]*:\s*```?\n?([\s\S]*?)(?:```|\n##|$))/i);
+      const yourRoleMatch = sysText.match(/## Your Role[\s\S]{0,200}?handle[^:]*:\s*([^\n]{10,300})/);
       if (yourRoleMatch?.[1]) {
         return yourRoleMatch[1].trim().slice(0, 300);
       }
