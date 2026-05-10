@@ -83,10 +83,12 @@ describe('routing matrix — chain order', () => {
     expect(names(chain)).toContain('groq');
   });
 
-  test('HEAVY + DIRECT — local first, then cloud, copilot last', async () => {
+  test('HEAVY + DIRECT — cloud first (too complex for local), vault context injected', async () => {
     const chain = await buildChain(SMALL_BODY, 'HEAVY', makeVault('DIRECT'), TEST_CONFIG);
-    expect(names(chain)[0]).toBe('ollama');
-    expect(names(chain)).toContain('copilot');
+    const ns = names(chain);
+    expect(ns[0]).not.toBe('ollama');   // cloud first
+    expect(ns).toContain('copilot');    // copilot in chain
+    expect(ns).not.toContain('ollama'); // no local at all for HEAVY
   });
 
   test('LIGHT + ADJACENT — local first, then groq, cerebras, mistral, google', async () => {

@@ -64,11 +64,19 @@ export async function buildChain(
   };
 
   if (vault.confidence === 'DIRECT') {
-    pushOllama(local32b, enriched);              // min 32b for quality on vault hits
-    push('google',   google   ? (b) => google(enriched)   : null);
-    push('groq',     groq     ? (b) => groq(enriched)     : null);
-    push('cerebras', cerebras ? (b) => cerebras(enriched) : null);
-    chain.push({ name: 'copilot', fn: () => copilot(enriched) });
+    if (complexity === 'HEAVY') {
+      // HEAVY+DIRECT: cloud-first — prompt too complex for 32b, but inject vault context
+      push('google',   google   ? () => google(enriched)   : null);
+      push('groq',     groq     ? () => groq(enriched)     : null);
+      chain.push({ name: 'copilot', fn: () => copilot(enriched) });
+    } else {
+      // LIGHT+DIRECT, MEDIUM+DIRECT: local-first with 32b minimum
+      pushOllama(local32b, enriched);
+      push('google',   google   ? () => google(enriched)   : null);
+      push('groq',     groq     ? () => groq(enriched)     : null);
+      push('cerebras', cerebras ? () => cerebras(enriched) : null);
+      chain.push({ name: 'copilot', fn: () => copilot(enriched) });
+    }
 
   } else if (vault.confidence === 'ADJACENT') {
     if (complexity === 'LIGHT') {
