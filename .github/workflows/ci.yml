@@ -1,20 +1,61 @@
+# GitHub Actions CI
+# Runs on every push and pull request to main branch
+
 name: CI
 
 on:
   push:
-    branches: [main]
+    branches: [ main ]
   pull_request:
-    branches: [main]
+    branches: [ main ]
 
 jobs:
-  build-and-test:
+  test:
     runs-on: ubuntu-latest
+    
+    strategy:
+      matrix:
+        node-version: [18.x, 20.x, 22.x]
+    
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
-        with:
-          node-version: '22'
-          cache: 'npm'
-      - run: npm ci
-      - run: npm run build
-      - run: npm test
+    # Checkout the repository code
+    - uses: actions/checkout@v4
+    
+    # Setup Node.js
+    - name: Use Node.js ${{ matrix.node-version }}
+      uses: actions/setup-node@v4
+      with:
+        node-version: ${{ matrix.node-version }}
+        cache: 'npm'
+    
+    # Install dependencies
+    - run: npm ci
+    
+    # Build TypeScript
+    - run: npm run build
+    
+    # Run tests
+    - run: npm test
+    
+    # Upload coverage (optional, requires codecov token)
+    # - uses: codecov/codecov-action@v3
+
+  lint:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Use Node.js 20.x
+      uses: actions/setup-node@v4
+      with:
+        node-version: 20.x
+        cache: 'npm'
+    
+    - run: npm ci
+    
+    # Type checking (catches TS errors without full build)
+    - run: npx tsc --noEmit
+    
+    # Lint check (if you add eslint later)
+    # - run: npm run lint

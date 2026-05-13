@@ -12,6 +12,8 @@ export interface ProviderConfig {
   baseUrl: string;
   apiKey?: string;
   defaultModel?: string;
+  dailyRequestLimit?: number;  // max requests per 24h rolling window (free tier enforcement)
+  maxRequestChars?: number;    // skip provider if request exceeds this size
 }
 
 export interface Config {
@@ -26,6 +28,7 @@ export interface Config {
     google?: ProviderConfig;
     mistral?: ProviderConfig;
     openrouter?: ProviderConfig;
+    ollamapro?: ProviderConfig;
   };
   qmd: {
     baseUrl: string;

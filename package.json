@@ -1,14 +1,36 @@
 {
   "name": "polly-route",
-  "version": "0.1.0",
+  "version": "1.0.0",
   "description": "Vault-aware intelligent LLM routing proxy for the Polly framework",
   "main": "dist/server.js",
   "scripts": {
     "build": "tsc",
     "start": "node dist/server.js",
     "dev": "ts-node src/server.ts",
-    "test": "node --experimental-vm-modules node_modules/.bin/jest"
+    "test": "node --experimental-vm-modules node_modules/.bin/jest",
+    "test:watch": "node --experimental-vm-modules node_modules/.bin/jest --watch",
+    "test:coverage": "node --experimental-vm-modules node_modules/.bin/jest --coverage"
   },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/brettgershon/polly-router.git"
+  },
+  "keywords": [
+    "llm",
+    "routing",
+    "proxy",
+    "openclaw",
+    "ollama",
+    "agent",
+    "vault",
+    "rag"
+  ],
+  "author": "Brett Gershon",
+  "license": "MIT",
+  "bugs": {
+    "url": "https://github.com/brettgershon/polly-router/issues"
+  },
+  "homepage": "https://github.com/brettgershon/polly-router#readme",
   "dependencies": {},
   "devDependencies": {
     "typescript": "^5.4.0",
@@ -16,5 +38,8 @@
     "jest": "^29.0.0",
     "@jest/globals": "^29.0.0",
     "ts-jest": "^29.0.0"
+  },
+  "engines": {
+    "node": ">=18.0.0"
   }
 }

@@ -5,6 +5,7 @@ import { probeVault } from './vault.js';
 import { buildChain } from './router.js';
 import { estimateCost } from './cost.js';
 import { record, recent, stats } from './log.js';
+import { recordRequest, budgetStatus } from './budget.js';
 import { RequestBody } from './types.js';
 import { contractTranslate, DEFAULT_LOCAL_SURFACE } from './contractTranslation.js';
 
@@ -51,44 +52,67 @@ function rewriteTextToolCall(raw: string): string {
       if (hasToolCalls || !content || typeof content !== 'string') continue;
 
       // Try to parse content as a tool call
-      // Handles three formats:
-      // 1. {"name": "tool", "arguments": {...}}  (standard JSON)
+      // Handles four formats:
+      // 1. {"name": "tool", "arguments": {...}}  (standard JSON, single call)
       // 2. tool_name {"arg": ...}                (Qwen bare format)
       // 3. prose text followed by JSON tool call  (Qwen mixed format)
-      let toolCall: any;
+      // 4. {"type":"function","name":"t",...}; {...}  (Cerebras multi-call, '; '-delimited)
       const trimmed = content.trim();
-      try {
-        toolCall = JSON.parse(trimmed);
-      } catch {
-        // Try bare format: "tool_name {...}"
-        const bareMatch = trimmed.match(/^(\w+)\s+(\{[\s\S]*\})$/);
-        if (bareMatch) {
-          try {
-            toolCall = { name: bareMatch[1], arguments: JSON.parse(bareMatch[2]) };
-          } catch { /* fall through */ }
+
+      /** Parse one JSON blob into a normalised {name, args} pair, or null. */
+      function parseSingleCall(s: string): { name: string; args: Record<string, unknown> } | null {
+        try {
+          const obj = JSON.parse(s.trim());
+          const name = obj.name ?? obj.function?.name;
+          if (typeof name !== 'string' || !name) return null;
+          return { name, args: obj.arguments ?? obj.parameters ?? obj.function?.arguments ?? {} };
+        } catch {
+          return null;
         }
-        // Try mixed format: prose + JSON tool call at end
-        if (!toolCall) {
-          const jsonMatch = trimmed.match(/\{\s*"name"\s*:\s*"(\w+)"[\s\S]*\}(?=[^\}]*$)/);
-          if (jsonMatch) {
-            try { toolCall = JSON.parse(jsonMatch[0]); } catch { /* fall through */ }
-          }
-        }
-        if (!toolCall) continue;
       }
 
-      if (typeof toolCall?.name !== 'string' || !toolCall.name) continue;
+      // Format 4: Cerebras '; '-delimited multi-call
+      const toolCalls: Array<{ name: string; args: Record<string, unknown> }> = [];
+      if (trimmed.includes('}; {')) {
+        const segments = trimmed.split(/;\s*(?=\{)/);
+        for (const seg of segments) {
+          const parsed = parseSingleCall(seg);
+          if (parsed) toolCalls.push(parsed);
+        }
+      }
+
+      // Formats 1/2/3: single call
+      if (toolCalls.length === 0) {
+        let single = parseSingleCall(trimmed);
+        if (!single) {
+          // Bare format: "tool_name {...}"
+          const bareMatch = trimmed.match(/^(\w+)\s+(\{[\s\S]*\})$/);
+          if (bareMatch) {
+            try { single = { name: bareMatch[1], args: JSON.parse(bareMatch[2]) }; } catch { /* fall through */ }
+          }
+        }
+        if (!single) {
+          // Mixed format: prose + JSON tool call at end
+          const jsonMatch = trimmed.match(/\{\s*"name"\s*:\s*"(\w+)"[\s\S]*\}(?=[^\}]*$)/);
+          if (jsonMatch) {
+            single = parseSingleCall(jsonMatch[0]);
+          }
+        }
+        if (single) toolCalls.push(single);
+      }
+
+      if (toolCalls.length === 0) continue;
 
       // Reformat into structured tool_calls
       msg.content = null;
-      msg.tool_calls = [{
-        id: `call_${Date.now()}`,
+      msg.tool_calls = toolCalls.map((tc, i) => ({
+        id: `call_${Date.now()}_${i}`,
         type: 'function',
         function: {
-          name: toolCall.name,
-          arguments: JSON.stringify(toolCall.arguments ?? toolCall.parameters ?? {}),
+          name: tc.name,
+          arguments: JSON.stringify(tc.args),
         },
-      }];
+      }));
       choice.finish_reason = 'tool_calls';
       rewritten = true;
     }
@@ -109,6 +133,14 @@ async function handleCompletions(req: http.IncomingMessage, res: http.ServerResp
   }
 
 
+  // TEMP: log incoming request shape for debugging
+  log('incoming-request', {
+    toolCount: body.tools?.length ?? 0,
+    toolNames: (body.tools ?? []).map((t: any) => t.function?.name),
+    systemPromptPreview: (body.messages?.find((m: any) => m.role === 'system')?.content as string ?? '').slice(0, 300),
+    messageCount: body.messages?.length ?? 0,
+  });
+
   const complexity  = classifyComplexity(body.messages ?? []);
   const userMsg     = getLastUserMessage(body.messages ?? []);
   const vaultSignal = await probeVault(body.messages ?? [], config);
@@ -128,14 +160,31 @@ async function handleCompletions(req: http.IncomingMessage, res: http.ServerResp
     try {
       // Contract translation for local model dispatch (design.md I1–I7)
       const isLocal = entry.name.startsWith('ollama/');
+      const isCerebras = entry.name === 'cerebras';
       let dispatchBody = body;
+
+      // Cerebras emits tool calls as serialized JSON text and ignores SOUL-level
+      // tool suppression instructions. Strip tools entirely so it answers in prose.
+      if (isCerebras && body.tools?.length) {
+        dispatchBody = { ...body, tools: undefined };
+        log('cerebras-tool-strip', { removedCount: body.tools.length });
+      }
+
       if (isLocal && body.tools?.length) {
         const modelId = entry.name.replace('ollama/', '');
         const maxChars = LOCAL_BUDGETS[modelId] ?? 8000 * 4;
+        // Agent-aware contract translation: if the agent's tool profile includes exec,
+        // preserve it in the local surface so filesystem-exploration agents can work.
+        const toolNames = body.tools.map((t: any) => t.function?.name).filter(Boolean);
+        const agentHasExec = toolNames.includes('exec');
+        log('tools-received', { toolNames, agentHasExec, model: modelId });
+        const localSurface = agentHasExec
+          ? [...DEFAULT_LOCAL_SURFACE, 'exec']
+          : DEFAULT_LOCAL_SURFACE;
         const translated = contractTranslate(
           body.messages ?? [],
           body.tools,
-          { localSurface: DEFAULT_LOCAL_SURFACE, maxTokens: Math.floor(maxChars / 4), model: modelId },
+          { localSurface, maxTokens: Math.floor(maxChars / 4), model: modelId },
         );
         log('contract-translation', {
           provider: entry.name,
@@ -234,6 +283,7 @@ async function handleCompletions(req: http.IncomingMessage, res: http.ServerResp
           const cost = estimateCost(entry.name, usage);
           log('complete', { provider: entry.name, complexity, vault: vaultSignal.confidence, ms, costUsd: cost?.total?.toFixed(6) ?? '0' });
           record({ ts: new Date().toISOString(), provider: entry.name, complexity, vault: vaultSignal.confidence, ms, costUsd: cost?.total ?? 0, inputTokens: usage?.prompt_tokens ?? 0, outputTokens: usage?.completion_tokens ?? 0 });
+          recordRequest(entry.name);
         });
         upstream.on('error', (e: Error) => {
           log('stream error', { provider: entry.name, error: e.message });
@@ -266,6 +316,7 @@ async function handleCompletions(req: http.IncomingMessage, res: http.ServerResp
           const cost = estimateCost(entry.name, usage);
           log('complete', { provider: entry.name, complexity, vault: vaultSignal.confidence, ms, costUsd: cost?.total?.toFixed(6) ?? '0' });
           record({ ts: new Date().toISOString(), provider: entry.name, complexity, vault: vaultSignal.confidence, ms, costUsd: cost?.total ?? 0, inputTokens: usage?.prompt_tokens ?? 0, outputTokens: usage?.completion_tokens ?? 0 });
+          recordRequest(entry.name);
         });
         upstream.on('error', (e: Error) => { log('stream error', { provider: entry.name, error: e.message }); if (!res.writableEnded) res.end(); });
         return;
@@ -327,7 +378,7 @@ function handleModels(_req: http.IncomingMessage, res: http.ServerResponse) {
 }
 
 function handleStatus(_req: http.IncomingMessage, res: http.ServerResponse) {
-  sendJson(res, 200, { status: 'ok', uptime: process.uptime(), ...stats() });
+  sendJson(res, 200, { status: 'ok', uptime: process.uptime(), ...stats(), budget: budgetStatus() });
 }
 
 function handleLog(req: http.IncomingMessage, res: http.ServerResponse) {

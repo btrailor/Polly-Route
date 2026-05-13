@@ -1,10 +1,11 @@
 import http from 'http';
 import { RequestBody, Complexity, VaultSignal } from './types.js';
-import { Config } from './config.js';
+import { Config, ProviderConfig } from './config.js';
 import { OllamaAdapter } from './providers/ollama.js';
-import { groqAdapter, cerebrasAdapter, googleAdapter, mistralAdapter, openrouterAdapter } from './providers/cloud.js';
+import { groqAdapter, cerebrasAdapter, googleAdapter, mistralAdapter, openrouterAdapter, ollamaProAdapter } from './providers/cloud.js';
 import { copilotAdapter } from './providers/copilot.js';
 import { injectVaultContext, estimateChars } from './injector.js';
+import { isProviderAvailable } from './budget.js';
 
 export interface ChainEntry {
   name: string;
@@ -56,61 +57,74 @@ export async function buildChain(
   const google    = p.google    ? googleAdapter(p.google)        : null;
   const mistral   = p.mistral   ? mistralAdapter(p.mistral)     : null;
   const openrouter = p.openrouter ? openrouterAdapter(p.openrouter) : null;
+  const ollamapro = p.ollamapro ? ollamaProAdapter(p.ollamapro) : null;
   const copilot   = copilotAdapter();
 
-  const push = (name: string, fn: ChainEntry['fn'] | null) => { if (fn) chain.push({ name, fn }); };
+  const push = (name: string, fn: ChainEntry['fn'] | null, cfg?: ProviderConfig) => {
+    if (!fn) return;
+    if (cfg && !isProviderAvailable(name, cfg.dailyRequestLimit, cfg.maxRequestChars, enrichedChars)) return;
+    chain.push({ name, fn });
+  };
   const pushOllama = (model: ReturnType<OllamaAdapter['pickModel']>, b: RequestBody) => {
     if (model) chain.push({ name: `ollama/${model.id}`, fn: (dispatchBody: RequestBody) => ollama.dispatch(model, dispatchBody) });
   };
 
   if (vault.confidence === 'DIRECT') {
     if (complexity === 'HEAVY') {
-      // HEAVY+DIRECT: cloud-first — prompt too complex for 32b, but inject vault context
-      push('google',   google   ? () => google(enriched)   : null);
-      push('groq',     groq     ? () => groq(enriched)     : null);
+      push('google',    google    ? () => google(enriched)    : null, p.google);
+      push('groq',      groq      ? () => groq(enriched)      : null, p.groq);
+      push('ollamapro', ollamapro ? () => ollamapro(enriched) : null, p.ollamapro);
       chain.push({ name: 'copilot', fn: () => copilot(enriched) });
     } else {
       // LIGHT+DIRECT, MEDIUM+DIRECT: local-first with 32b minimum
       pushOllama(local32b, enriched);
-      push('google',   google   ? () => google(enriched)   : null);
-      push('groq',     groq     ? () => groq(enriched)     : null);
-      push('cerebras', cerebras ? () => cerebras(enriched) : null);
+      push('groq',      groq      ? () => groq(enriched)      : null, p.groq);
+      push('google',    google    ? () => google(enriched)    : null, p.google);
+      push('cerebras',  cerebras  ? () => cerebras(enriched)  : null, p.cerebras);
+      push('ollamapro', ollamapro ? () => ollamapro(enriched) : null, p.ollamapro);
       chain.push({ name: 'copilot', fn: () => copilot(enriched) });
     }
 
   } else if (vault.confidence === 'ADJACENT') {
     if (complexity === 'LIGHT') {
       pushOllama(localAny, enriched);
-      push('groq',     groq     ? () => groq(enriched)     : null);
-      push('cerebras', cerebras ? () => cerebras(enriched) : null);
-      push('mistral',  mistral  ? () => mistral(enriched)  : null);
-      push('google',   google   ? () => google(enriched)   : null);
+      push('groq',      groq      ? () => groq(enriched)      : null, p.groq);
+      push('cerebras',  cerebras  ? () => cerebras(enriched)  : null, p.cerebras);
+      push('mistral',   mistral   ? () => mistral(enriched)   : null, p.mistral);
+      push('google',    google    ? () => google(enriched)    : null, p.google);
+      push('ollamapro', ollamapro ? () => ollamapro(enriched) : null, p.ollamapro);
     } else if (complexity === 'MEDIUM') {
-      push('google',   google   ? () => google(enriched)   : null);
-      push('groq',     groq     ? () => groq(enriched)     : null);
+      push('groq',      groq      ? () => groq(enriched)      : null, p.groq);
+      push('google',    google    ? () => google(enriched)    : null, p.google);
+      push('mistral',   mistral   ? () => mistral(enriched)   : null, p.mistral);
       pushOllama(localAny, enriched);
-      push('cerebras', cerebras ? () => cerebras(enriched) : null);
+      push('cerebras',  cerebras  ? () => cerebras(enriched)  : null, p.cerebras);
+      push('ollamapro', ollamapro ? () => ollamapro(enriched) : null, p.ollamapro);
     } else {
-      push('google',   google   ? () => google(enriched)   : null);
-      push('groq',     groq     ? () => groq(enriched)     : null);
+      push('google',    google    ? () => google(enriched)    : null, p.google);
+      push('groq',      groq      ? () => groq(enriched)      : null, p.groq);
+      push('ollamapro', ollamapro ? () => ollamapro(enriched) : null, p.ollamapro);
       chain.push({ name: 'copilot', fn: () => copilot(enriched) });
     }
 
   } else { // ABSENT
     if (complexity === 'LIGHT') {
-      push('groq',     groq     ? () => groq(body)     : null);
-      push('cerebras', cerebras ? () => cerebras(body) : null);
-      push('mistral',  mistral  ? () => mistral(body)  : null);
-      push('google',   google   ? () => google(body)   : null);
+      push('groq',      groq      ? () => groq(body)      : null, p.groq);
+      push('cerebras',  cerebras  ? () => cerebras(body)  : null, p.cerebras);
+      push('mistral',   mistral   ? () => mistral(body)   : null, p.mistral);
+      push('google',    google    ? () => google(body)    : null, p.google);
+      push('ollamapro', ollamapro ? () => ollamapro(body) : null, p.ollamapro);
     } else if (complexity === 'MEDIUM') {
-      push('groq',     groq     ? () => groq(body)     : null);
-      push('google',   google   ? () => google(body)   : null);
-      push('cerebras', cerebras ? () => cerebras(body) : null);
-      push('mistral',  mistral  ? () => mistral(body)  : null);
-    } else {
+      push('groq',      groq      ? () => groq(body)      : null, p.groq);
+      push('google',    google    ? () => google(body)    : null, p.google);
+      push('mistral',   mistral   ? () => mistral(body)   : null, p.mistral);
+      push('cerebras',  cerebras  ? () => cerebras(body)  : null, p.cerebras);
+      push('ollamapro', ollamapro ? () => ollamapro(body) : null, p.ollamapro);
+    } else { // HEAVY
+      push('google',    google    ? () => google(body)    : null, p.google);
+      push('groq',      groq      ? () => groq(body)      : null, p.groq);
+      push('ollamapro', ollamapro ? () => ollamapro(body) : null, p.ollamapro);
       chain.push({ name: 'copilot', fn: () => copilot(body) });
-      push('google',   google   ? () => google(body)   : null);
-      push('groq',     groq     ? () => groq(body)     : null);
     }
   }
 

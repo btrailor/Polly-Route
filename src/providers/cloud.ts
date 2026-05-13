@@ -36,3 +36,8 @@ export function openrouterAdapter(cfg: ProviderConfig) {
       extraHeaders: { 'HTTP-Referer': 'https://polly-route' },
     });
 }
+
+export function ollamaProAdapter(cfg: ProviderConfig) {
+  return (body: RequestBody): Promise<http.IncomingMessage> =>
+    dispatchOpenAI(cfg.baseUrl, cfg.apiKey ?? '', cfg.defaultModel ?? 'gemma4:31b', body, { timeoutMs: 60000 });
+}

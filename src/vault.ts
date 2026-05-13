@@ -23,9 +23,12 @@ function getLastUserText(messages: Message[]): string {
     if (sys) {
       const sysText = typeof sys.content === 'string' ? sys.content : '';
       // Prefer ## Your Role content — that's the actual task, most relevant for vault probe
-      const yourRoleMatch = sysText.match(/## Your Role[\s\S]{0,200}?handle[^:]*:\s*([^\n]{10,300})/);
+      // Match ## Your Role followed by any text until next ## heading or end of string
+      const yourRoleMatch = sysText.match(/## Your Role\n([\s\S]{10,300}?)(?=\n## |$)/);
       if (yourRoleMatch?.[1]) {
-        return yourRoleMatch[1].trim().slice(0, 300);
+        // Strip any leading boilerplate like "handle:" or "Your assigned task is"
+        const task = yourRoleMatch[1].replace(/^handle[^:]*:\s*/i, '').replace(/^Your assigned task is\s*/i, '').trim();
+        if (task.length >= 10) return task.slice(0, 300);
       }
       // Fallback: grab first 300 chars of substance after stripping boilerplate headings
       const stripped = sysText.replace(/##.*?\n/g, '').replace(/^[-*].*?\n/gm, '').trim();

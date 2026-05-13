@@ -1,0 +1,45 @@
+# Release workflow
+# Triggered when a version tag (v*) is pushed
+# Builds, tests, and creates a GitHub release
+
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Use Node.js 20.x
+      uses: actions/setup-node@v4
+      with:
+        node-version: 20.x
+        cache: 'npm'
+    
+    # Install and build
+    - run: npm ci
+    - run: npm run build
+    
+    # Run tests
+    - run: npm test
+    
+    # Package for distribution
+    - run: |
+        mkdir -p dist/polly-router
+        cp -r dist/ package.json README.md LICENSE CHANGELOG.md dist/polly-router/
+        tar czf polly-router-${GITHUB_REF_NAME}.tar.gz -C dist polly-router
+    
+    # Create GitHub Release
+    - name: Create Release
+      uses: softprops/action-gh-release@v1
+      with:
+        files: polly-router-*.tar.gz
+        generate_release_notes: true
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
