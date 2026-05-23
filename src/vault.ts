@@ -2,6 +2,31 @@ import http from 'http';
 import { Message, VaultSignal } from './types.js';
 import { Config } from './config.js';
 
+// ---------------------------------------------------------------------------
+// Knowledge Skill types
+// ---------------------------------------------------------------------------
+
+interface KSResult {
+  chunk_id: string;
+  text: string;
+  title: string;
+  section: string;
+  score: number;
+  retrieval_tier: 'DIRECT' | 'ADJACENT';
+}
+
+interface KSResponse {
+  results: KSResult[];
+  query_time_ms: number;
+  error?: string;
+}
+
+// Thresholds from RAG_ROUTING_ARCHITECTURE.md (validated Feb 1 2026)
+const KS_DIRECT_THRESHOLD = 0.75;
+const KS_ADJACENT_THRESHOLD = 0.45;
+const MIN_HIGH_QUALITY = 2;
+const MIN_CONTEXT_CHARS = 500;
+
 function log(msg: string, meta?: object) {
   const s = meta ? ' ' + JSON.stringify(meta) : '';
   console.log(`[${new Date().toISOString()}] ${msg}${s}`);
@@ -38,11 +63,68 @@ function getLastUserText(messages: Message[]): string {
   return text;
 }
 
-export async function probeVault(messages: Message[], config: Config): Promise<VaultSignal> {
-  const query = getLastUserText(messages).slice(0, 300).replace(/\n/g, ' ').replace(/-/g, ' ');
-  if (!query) return { confidence: 'ABSENT', score: 0, chunks: [] };
-  log('vault probe query', { query, timeoutMs: config.qmd.timeoutMs, url: config.qmd.baseUrl });
+// ---------------------------------------------------------------------------
+// Knowledge Skill probe (primary)
+// ---------------------------------------------------------------------------
 
+async function probeKnowledgeSkill(
+  query: string,
+  baseUrl: string,
+  timeoutMs: number,
+): Promise<VaultSignal | null> {
+  try {
+    const res = await fetch(`${baseUrl}/search`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ query: query.slice(0, 500), top_k: 10, include_adjacent: true }),
+      signal: AbortSignal.timeout(timeoutMs),
+    });
+
+    if (!res.ok) return null;
+
+    const data = (await res.json()) as KSResponse;
+    if (data.error || !data.results || data.results.length === 0) return null;
+
+    const results = data.results;
+    const topScore = results[0]?.score ?? 0;
+    const highQualityCount = results.filter(r => r.score >= KS_DIRECT_THRESHOLD).length;
+    const contextChars = results
+      .slice(0, 10)
+      .reduce((sum, r) => sum + (r.text?.length ?? 0), 0);
+
+    const vaultChunks = results
+      .slice(0, 3)
+      .map((r: KSResult) => r.text ?? '')
+      .filter(Boolean);
+
+    let confidence: VaultSignal['confidence'];
+    if (
+      topScore >= KS_DIRECT_THRESHOLD &&
+      highQualityCount >= MIN_HIGH_QUALITY &&
+      contextChars >= MIN_CONTEXT_CHARS
+    ) {
+      confidence = 'DIRECT';
+    } else if (topScore >= KS_ADJACENT_THRESHOLD) {
+      confidence = 'ADJACENT';
+    } else {
+      confidence = 'ABSENT';
+    }
+
+    return { confidence, score: topScore, chunks: vaultChunks };
+  } catch {
+    return null; // unavailable or timed out
+  }
+}
+
+// ---------------------------------------------------------------------------
+// QMD fallback probe
+// ---------------------------------------------------------------------------
+
+function probeQMD(
+  query: string,
+  config: Config,
+  resolve: (value: VaultSignal) => void,
+): void {
   const body = JSON.stringify({
     searches: [
       { type: 'vec', query },
@@ -52,54 +134,78 @@ export async function probeVault(messages: Message[], config: Config): Promise<V
     minScore: config.qmd.minScore ?? 0.89,
   });
 
-  return new Promise((resolve) => {
-    const timer = setTimeout(() => {
-      log('vault probe timeout');
-      resolve({ confidence: 'ABSENT', score: 0, chunks: [] });
-    }, config.qmd.timeoutMs);
+  const timer = setTimeout(() => {
+    log('vault probe timeout');
+    resolve({ confidence: 'ABSENT', score: 0, chunks: [] });
+  }, config.qmd.timeoutMs);
 
-    const url = new URL('/query', config.qmd.baseUrl);
-    const req = http.request({
-      hostname: url.hostname,
-      port: url.port || 8181,
-      path: url.pathname,
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body) },
-    }, (res) => {
-      const chunks: Buffer[] = [];
-      res.on('data', c => chunks.push(c));
-      res.on('end', () => {
-        clearTimeout(timer);
-        try {
-          const raw = JSON.parse(Buffer.concat(chunks).toString());
-          const results: any[] = Array.isArray(raw) ? raw : (raw.results ?? []);
-          if (!results.length) return resolve({ confidence: 'ABSENT', score: 0, chunks: [] });
-
-          const topScore: number = results[0].score ?? 0;
-          const vaultChunks = results.slice(0, 3)
-            .map((r: any) => r.snippet ?? r.content ?? '')
-            .filter(Boolean);
-
-          let confidence: VaultSignal['confidence'];
-          if (topScore >= 0.92 && results.length >= 1) confidence = 'DIRECT';
-          else if (topScore >= 0.89) confidence = 'ADJACENT';
-          else confidence = 'ABSENT';
-
-          resolve({ confidence, score: topScore, chunks: vaultChunks });
-        } catch (e) {
-          log('vault probe parse error', { error: (e as Error).message });
-          resolve({ confidence: 'ABSENT', score: 0, chunks: [] });
-        }
-      });
-    });
-
-    req.on('error', (e) => {
+  const url = new URL('/query', config.qmd.baseUrl);
+  const req = http.request({
+    hostname: url.hostname,
+    port: url.port || 8181,
+    path: url.pathname,
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body) },
+  }, (res) => {
+    const chunks: Buffer[] = [];
+    res.on('data', c => chunks.push(c));
+    res.on('end', () => {
       clearTimeout(timer);
-      log('vault probe error', { error: e.message });
-      resolve({ confidence: 'ABSENT', score: 0, chunks: [] });
-    });
+      try {
+        const raw = JSON.parse(Buffer.concat(chunks).toString());
+        const results: any[] = Array.isArray(raw) ? raw : (raw.results ?? []);
+        if (!results.length) return resolve({ confidence: 'ABSENT', score: 0, chunks: [] });
 
-    req.write(body);
-    req.end();
+        const topScore: number = results[0].score ?? 0;
+        const vaultChunks = results.slice(0, 3)
+          .map((r: any) => r.snippet ?? r.content ?? '')
+          .filter(Boolean);
+
+        let confidence: VaultSignal['confidence'];
+        if (topScore >= 0.92 && results.length >= 1) confidence = 'DIRECT';
+        else if (topScore >= 0.89) confidence = 'ADJACENT';
+        else confidence = 'ABSENT';
+
+        resolve({ confidence, score: topScore, chunks: vaultChunks });
+      } catch (e) {
+        log('vault probe parse error', { error: (e as Error).message });
+        resolve({ confidence: 'ABSENT', score: 0, chunks: [] });
+      }
+    });
+  });
+
+  req.on('error', (e) => {
+    clearTimeout(timer);
+    log('vault probe error', { error: e.message });
+    resolve({ confidence: 'ABSENT', score: 0, chunks: [] });
+  });
+
+  req.write(body);
+  req.end();
+}
+
+export async function probeVault(messages: Message[], config: Config): Promise<VaultSignal> {
+  const query = getLastUserText(messages).slice(0, 300).replace(/\n/g, ' ').replace(/-/g, ' ');
+  if (!query) return { confidence: 'ABSENT', score: 0, chunks: [] };
+
+  // Try Knowledge Skill first
+  if (config.knowledgeSkill) {
+    log('vault probe: trying Knowledge Skill', { url: config.knowledgeSkill.baseUrl });
+    const ksResult = await probeKnowledgeSkill(
+      query,
+      config.knowledgeSkill.baseUrl,
+      config.knowledgeSkill.timeoutMs,
+    );
+    if (ksResult !== null) {
+      log('vault probe: Knowledge Skill result', { confidence: ksResult.confidence, score: ksResult.score });
+      return ksResult;
+    }
+    log('vault probe: Knowledge Skill unavailable, falling back to QMD');
+  }
+
+  // Fall back to QMD
+  log('vault probe: trying QMD', { query, timeoutMs: config.qmd.timeoutMs, url: config.qmd.baseUrl });
+  return new Promise((resolve) => {
+    probeQMD(query, config, resolve);
   });
 }

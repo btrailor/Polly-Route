@@ -36,6 +36,10 @@ export interface Config {
     timeoutMs: number;
     minScore: number;
   };
+  knowledgeSkill?: {
+    baseUrl: string;
+    timeoutMs: number;
+  };
 }
 
 const DEFAULT_OLLAMA_MODELS: OllamaModel[] = [
@@ -67,6 +71,10 @@ export function loadConfig(): Config {
       collection: raw.qmd?.collection ?? 'vault',
       timeoutMs: raw.qmd?.timeoutMs ?? 500,
       minScore: raw.qmd?.minScore ?? 0.89,
+    },
+    knowledgeSkill: raw.knowledgeSkill ?? {
+      baseUrl: 'http://localhost:4201',
+      timeoutMs: 2000,
     },
   };
 }
