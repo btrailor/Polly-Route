@@ -14,6 +14,7 @@ export interface ProviderConfig {
   defaultModel?: string;
   dailyRequestLimit?: number;  // max requests per 24h rolling window (free tier enforcement)
   maxRequestChars?: number;    // skip provider if request exceeds this size
+  timeoutMs?: number;           // optional per-provider timeout override
 }
 
 export interface Config {
@@ -25,6 +26,8 @@ export interface Config {
   providers: {
     groq?: ProviderConfig;
     cerebras?: ProviderConfig;
+    deepseek?: ProviderConfig;
+    openrouter_free?: ProviderConfig;
     google?: ProviderConfig;
     mistral?: ProviderConfig;
     openrouter?: ProviderConfig;
