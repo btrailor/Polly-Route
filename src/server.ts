@@ -427,10 +427,42 @@ server.listen(config.port, '127.0.0.1', async () => {
   }
 });
 
-server.on('error', (e: Error & { code?: string }) => {
-  if (e.code === 'EADDRINUSE') console.error(`[polly-route] Port ${config.port} in use`);
-  else console.error('[polly-route] Server error:', e.message);
-  process.exit(1);
+server.on('error', async (e: Error & { code?: string }) => {
+  if (e.code === 'EADDRINUSE') {
+    console.error(`[polly-route] Port ${config.port} in use — checking for stale listener...`);
+    try {
+      const killed = await new Promise<boolean>((resolve) => {
+        const req = http.request({
+          hostname: '127.0.0.1',
+          port: config.port,
+          path: '/health',
+          method: 'GET',
+          timeout: 500,
+        }, (res) => {
+          res.resume();
+          resolve(res.statusCode === 200);
+        });
+        req.on('error', () => resolve(false));
+        req.setTimeout(500, () => { req.destroy(); resolve(false); });
+        req.end();
+      });
+      if (killed) {
+        console.error(`[polly-route] Stale listener confirmed on port ${config.port}; attempting graceful exit...`);
+        // Cannot actually kill the other process from here, so just exit gracefully
+        console.error(`[polly-route] Please stop the other process and restart.`);
+        process.exit(1);
+      } else {
+        console.error(`[polly-route] Port ${config.port} appears occupied but unresponsive; retrying in 1s...`);
+        setTimeout(() => server.listen(config.port, '127.0.0.1'), 1000);
+      }
+    } catch {
+      console.error(`[polly-route] Port ${config.port} in use, retrying in 1s...`);
+      setTimeout(() => server.listen(config.port, '127.0.0.1'), 1000);
+    }
+  } else {
+    console.error('[polly-route] Server error:', e.message);
+    process.exit(1);
+  }
 });
 
 process.on('SIGTERM', () => { server.close(); process.exit(0); });

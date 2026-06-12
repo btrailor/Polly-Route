@@ -68,7 +68,14 @@ export function loadConfig(): Config {
       baseUrl: raw.ollama?.baseUrl ?? 'http://127.0.0.1:11434',
       models: raw.ollama?.models ?? DEFAULT_OLLAMA_MODELS,
     },
-    providers: raw.providers ?? {},
+    providers: {
+      groq:      raw.providers?.groq      ? { ...raw.providers.groq,      apiKey: process.env.GROQ_API_KEY      ?? raw.providers.groq.apiKey }      : undefined,
+      cerebras:  raw.providers?.cerebras  ? { ...raw.providers.cerebras,  apiKey: process.env.CEREBRAS_API_KEY  ?? raw.providers.cerebras.apiKey }  : undefined,
+      google:    raw.providers?.google    ? { ...raw.providers.google,    apiKey: process.env.GOOGLE_API_KEY    ?? raw.providers.google.apiKey }    : undefined,
+      mistral:   raw.providers?.mistral   ? { ...raw.providers.mistral,   apiKey: process.env.MISTRAL_API_KEY   ?? raw.providers.mistral.apiKey }   : undefined,
+      openrouter: raw.providers?.openrouter ? { ...raw.providers.openrouter, apiKey: process.env.OPENROUTER_API_KEY ?? raw.providers.openrouter.apiKey } : undefined,
+      ollamapro: raw.providers?.ollamapro ? { ...raw.providers.ollamapro, apiKey: process.env.OLLAMAPRO_API_KEY ?? raw.providers.ollamapro.apiKey } : undefined,
+    },
     qmd: {
       baseUrl: raw.qmd?.baseUrl ?? 'http://localhost:8181',
       collection: raw.qmd?.collection ?? 'vault',
