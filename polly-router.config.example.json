@@ -18,5 +18,10 @@
     "baseUrl": "http://localhost:8181",
     "collection": "vault",
     "timeoutMs": 500
+  },
+  "conductor": {
+    "domainsDir": "~/my-domains",
+    "timeoutMs": 2000,
+    "minScore": 0.35
   }
 }

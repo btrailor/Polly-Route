@@ -13,6 +13,7 @@ Most agent frameworks hardcode a single model per agent. That wastes money on si
 - **Free-first routing**: Local Ollama models handle routine work
 - **Intelligent escalation**: Hard queries automatically reach cloud providers (Groq, Google, Copilot, etc.)
 - **Vault integration**: Your Obsidian vault content is injected as context when relevant
+- **Domain-aware routing**: Conductor domain manifests inject action menus and bias routing toward local models for domain-specific tasks
 - **Cost tracking**: Per-model budgets and daily limits prevent runaway spending
 - **Agent-aware contracts**: Local models get reduced toolsets; cloud models get full capability
 
@@ -55,6 +56,12 @@ User Request
 ┌─────────────────┐
 │   Vault Probe   │  ──► Query QMD for relevant vault chunks
 │   (QMD/RAG)     │     ABSENT | LOW | MEDIUM | HIGH confidence
+└─────────────────┘
+    │
+    ▼
+┌─────────────────┐
+│ Conductor Probe │  ──► Scan domain manifests for matching actions
+│ (domain-aware)  │     Inject action menu + bias toward local models
 └─────────────────┘
     │
     ▼
@@ -125,6 +132,77 @@ User Request
 5. **Mistral** (free tier) — Structured JSON reliable
 6. **Ollama Pro** (paid) — Cloud Ollama, premium fallback
 7. **GitHub Copilot** (paid) — Claude Sonnet, Opus
+
+---
+
+## Conductor Domain Probes
+
+Polly Router can detect when a user's request matches a domain you've defined and inject structured context that helps local models produce correct output.
+
+### How it works
+
+1. You create **domain manifests** — JSON files that describe a domain's available actions, their command templates, and trigger phrases
+2. When a request comes in, the conductor probe scores the user's query against all manifests in your configured domains directory
+3. If a match is found, the action menu is injected as context and routing is biased toward local models (which can now handle the task because they have the exact commands)
+4. If no match, routing proceeds normally
+
+### Defining a domain
+
+Create a directory with a `manifest.json`:
+
+```bash
+mkdir -p ~/my-domains/my-project
+cp manifest.example.json ~/my-domains/my-project/manifest.json
+# Edit the manifest to define your actions
+```
+
+Manifest schema (see `manifest.example.json` for a full template):
+
+```json
+{
+  "domain": "my-domain",
+  "description": "Describe what this domain covers — used for keyword matching",
+  "actions": [
+    {
+      "id": "my_action",
+      "description": "What this action does",
+      "triggers": ["generate", "create", "build"],
+      "params": {
+        "name": { "type": "string", "required": true }
+      },
+      "execute": "python3 run.py --name {{name}}",
+      "gates": ["exit_zero"],
+      "timeout": 60
+    }
+  ]
+}
+```
+
+Key fields:
+
+| Field | Purpose |
+|-------|--------|
+| `domain` | Stable identifier for the domain |
+| `description` | Used for keyword matching against user queries |
+| `actions[].triggers` | Phrases that boost the action's match score when they appear in the query. Domain-agnostic — any domain declares its own |
+| `actions[].execute` | Command template with `{{param}}` substitution |
+| `actions[].gates` | Deterministic checks to run after execution (`exit_zero`, `valid_json_output`, or custom scripts) |
+
+### Wiring it into Polly Router
+
+Add the conductor config block to your `polly-router.config.json`:
+
+```json
+{
+  "conductor": {
+    "domainsDir": "~/my-domains",
+    "timeoutMs": 2000,
+    "minScore": 0.35
+  }
+}
+```
+
+That's it. Drop manifests in the directory, restart the router, and domain-aware routing is active.
 
 ---
 
