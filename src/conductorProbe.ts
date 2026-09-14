@@ -155,19 +155,29 @@ function scoreDomain(
  * This is injected into the request as a system message so the model
  * knows the exact action menu, command templates, and constraints.
  */
-function buildContextBlock(manifest: DomainManifest, matchedActionId: string | null): string {
+function buildContextBlock(
+  manifest: DomainManifest,
+  matchedActionId: string | null,
+  domainsDir: string,
+): string {
   const actionLines = manifest.actions.map(a => {
     const params = a.params
       ? Object.entries(a.params)
           .map(([k, v]) => `${k}: ${v.type}${v.required ? ' (required)' : ''}`)
           .join(', ')
       : 'none';
-    return `- ${a.id}: ${a.description}\n  params: ${params}\n  execute: ${a.execute}`;
+    const gates = a.gates?.length ? a.gates.join(', ') : 'none';
+    return `- ${a.id}: ${a.description}\n  params: ${params}\n  execute: ${a.execute}\n  gates: ${gates}`;
   });
 
   const matchedHint = matchedActionId
     ? `\n\n**Suggested action**: "${matchedActionId}" — use the execute command template above.`
     : '';
+
+  // Build gate verification instructions for the matched action.
+  // This tells the agent how to verify the action's output using the
+  // deterministic gate scripts from the domain's gates/ directory.
+  const gateInstructions = buildGateInstructions(manifest, matchedActionId, domainsDir);
 
   return [
     `Conductor domain: ${manifest.domain}`,
@@ -179,7 +189,118 @@ function buildContextBlock(manifest: DomainManifest, matchedActionId: string | n
     matchedHint,
     ``,
     manifest.system_prompt ?? '',
+    gateInstructions,
   ].filter(Boolean).join('\n');
+}
+
+/**
+ * Build gate verification instructions for the agent.
+ *
+ * When a conductor domain matches, the agent should verify the action's
+ * output by running the domain's gate scripts after executing the command.
+ * This tells the agent which gates to run, where to find them, and how to
+ * pass context (params, stdout, exit code) to each gate.
+ */
+function buildGateInstructions(
+  manifest: DomainManifest,
+  matchedActionId: string | null,
+  domainsDir: string,
+): string {
+  if (!matchedActionId) return '';
+  const action = manifest.actions.find(a => a.id === matchedActionId);
+  if (!action || !action.gates || action.gates.length === 0) return '';
+
+  const domainDir = path.join(domainsDir, manifest.domain);
+  const gatesDir = path.join(domainDir, 'gates');
+
+  // Check which gates have scripts
+  const BUILTIN_GATES = new Set(['exit_zero', 'valid_json_output']);
+  const gateEntries = action.gates.map(g => {
+    if (BUILTIN_GATES.has(g)) {
+      return { name: g, type: 'builtin' as const, desc: builtinGateDesc(g) };
+    }
+    // Look for .sh or .py gate script
+    const shPath = path.join(gatesDir, `${g}.sh`);
+    const pyPath = path.join(gatesDir, `${g}.py`);
+    if (fs.existsSync(shPath)) {
+      return { name: g, type: 'script' as const, path: shPath, interpreter: 'bash' };
+    }
+    if (fs.existsSync(pyPath)) {
+      return { name: g, type: 'script' as const, path: pyPath, interpreter: 'python3' };
+    }
+    return { name: g, type: 'unknown' as const, desc: 'no script found' };
+  });
+
+  const hasScripts = gateEntries.some(g => g.type === 'script');
+  if (!hasScripts && gateEntries.every(g => g.type === 'builtin')) {
+    // All builtin gates — just list what to check
+    const checks = gateEntries.map(g => `- ${g.desc}`).join('\n');
+    return `\n## Verification\n\nAfter executing "${matchedActionId}", verify the output:\n${checks}`;
+  }
+
+  // Build gate runner instructions
+  const paramNames = action.params
+    ? Object.keys(action.params).map(k => `{{${k}}}`)
+    : [];
+  const paramEnvVars = paramNames.length > 0
+    ? paramNames.map(p => `GATE_PARAM_${p.replace(/\{\{|\}\}/g, '').toUpperCase()}="<value>"`)
+    : [];
+
+  const gateRunCommands = gateEntries
+    .filter(g => g.type === 'script')
+    .map(g => {
+      if (g.type === 'script') {
+        const cmd = g.interpreter === 'bash'
+          ? `bash ${g.path}`
+          : `python3 ${g.path}`;
+        return `  ${g.name}: ${cmd}`;
+      }
+      return '';
+    })
+    .filter(Boolean)
+    .join('\n');
+
+  const builtinChecks = gateEntries
+    .filter(g => g.type === 'builtin')
+    .map(g => `  ${g.name}: ${g.desc}`)
+    .join('\n');
+
+  const sections = [
+    `\n## Verification`,
+    ``,
+    `After executing "${matchedActionId}", verify the output by running these gates:`,
+  ];
+
+  if (gateRunCommands) {
+    sections.push('', 'Gate scripts (run each, exit 0 = pass, exit 1 = fail):');
+    sections.push(gateRunCommands);
+    sections.push('');
+    sections.push('Pass context to gates via environment variables:');
+    sections.push('- CONDUCTOR_WORKSPACE: the working directory');
+    sections.push('- GATE_PARAM_<KEY>: each param value (e.g. GATE_PARAM_PROJECT=quarry)');
+    sections.push('- GATE_ACTION_ID: the action that was executed');
+    sections.push('- GATE_EXIT_CODE: the exit code from the action');
+    sections.push('');
+    sections.push('Or write a context JSON file and set CONDUCTOR_GATE_CONTEXT_FILE to its path.');
+  }
+
+  if (builtinChecks) {
+    sections.push('', 'Built-in checks:');
+    sections.push(builtinChecks);
+  }
+
+  return sections.join('\n');
+}
+
+function builtinGateDesc(name: string): string {
+  switch (name) {
+    case 'exit_zero':
+      return 'Verify the command exited with code 0.';
+    case 'valid_json_output':
+      return 'Verify the command stdout is valid JSON.';
+    default:
+      return name;
+  }
 }
 
 /**
@@ -276,7 +397,7 @@ export async function probeConductor(
   }
 
   // Build the context block and signal
-  const contextBlock = buildContextBlock(bestDomain.manifest, bestDomain.matchedActionId);
+  const contextBlock = buildContextBlock(bestDomain.manifest, bestDomain.matchedActionId, domainsDir);
 
   const actions: ConductorAction[] = bestDomain.manifest.actions.map(a => ({
     id: a.id,
