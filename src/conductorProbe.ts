@@ -116,11 +116,17 @@ function scoreDomain(
     // Triggers are declared per-action in the manifest's `triggers` field.
     // This is domain-agnostic — any domain can declare its own triggers
     // without changes to the probe code.
+    //
+    // Trigger boosts are NOT normalized by query length — a trigger match
+    // is a strong intent signal regardless of how much other text surrounds
+    // it. Keyword overlap is normalized (below), but trigger boosts are
+    // additive to the final score.
     const triggers = action.triggers ?? [];
     let hasTriggerMatch = false;
+    let triggerBoost = 0;
     for (const trigger of triggers) {
       if (fullText.includes(trigger)) {
-        actionScore += 2;
+        triggerBoost += 0.4;
         hasTriggerMatch = true;
       }
     }
@@ -134,8 +140,9 @@ function scoreDomain(
       actionScore *= 0.5;
     }
 
-    // Normalize by query length to keep scores in range
-    const normalized = actionScore / Math.max(queryWords.size, 1);
+    // Normalize keyword overlap by query length to keep scores in range.
+    // Then add the un-normalized trigger boost and cap at 1.0.
+    const normalized = Math.min(1, (actionScore / Math.max(queryWords.size, 1)) + triggerBoost);
 
     if (normalized > bestActionScore) {
       bestActionScore = normalized;
