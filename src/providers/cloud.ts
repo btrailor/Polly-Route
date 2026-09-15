@@ -58,7 +58,7 @@ export function openrouterFreeAdapter(cfg: ProviderConfig) {
 
 export function ollamaProAdapter(cfg: ProviderConfig) {
   return (body: RequestBody): Promise<http.IncomingMessage> => {
-    const model = body.model ?? cfg.defaultModel ?? 'gemma4:31b';
+    const model = (body.model && body.model !== 'auto') ? body.model : (cfg.defaultModel ?? 'gemma4:31b');
     return dispatchOpenAI(cfg.baseUrl, cfg.apiKey ?? '', model, body, { timeoutMs: cfg.timeoutMs ?? 60000 });
   };
 }

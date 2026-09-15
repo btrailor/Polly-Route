@@ -28,7 +28,7 @@ export class OllamaAdapter {
       'ollama',
       model.id,
       nonStreamBody,
-      { timeoutMs: 120000 }
+      { timeoutMs: 600000 }
     );
   }
 

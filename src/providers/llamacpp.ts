@@ -39,7 +39,7 @@ export class LlamacppAdapter {
       'llamacpp', // no API key needed for local llama-server
       this.endpoint.model,
       nonStreamBody,
-      { timeoutMs: 120000 }
+      { timeoutMs: 600000 }
     );
   }
 
