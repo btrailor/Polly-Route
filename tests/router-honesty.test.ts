@@ -117,7 +117,7 @@ describe('contractTranslate wiring (local path)', () => {
     });
     const keptNames = result.tools.map(t => t.function.name);
     expect(keptNames).not.toContain('cron');
-    expect(keptNames).not.toContain('exec');
+    expect(keptNames).toContain('exec');
     expect(keptNames).toContain('memory_search');
   });
 
@@ -127,10 +127,10 @@ describe('contractTranslate wiring (local path)', () => {
       maxTokens: 8000,
     });
     const sys = result.messages.find(m => m.role === 'system')?.content as string;
-    // The available tools line should not name cron or exec
+    // The available tools line should not name cron; exec is part of the local surface
     const availableLine = sys.match(/Available tools: (.*)/)?.[1] ?? '';
     expect(availableLine).not.toContain('cron');
-    expect(availableLine).not.toContain('exec');
+    expect(availableLine).toContain('exec');
   });
 
   test('translated system prompt preserves identity', () => {

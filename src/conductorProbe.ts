@@ -56,6 +56,7 @@ function loadManifest(dirPath: string): DomainManifest | null {
 function scoreDomain(
   query: string,
   manifest: DomainManifest,
+  fullText: string,
 ): { score: number; matchedActionId: string | null } {
   const q = query.toLowerCase();
   // Filter out common stop words that cause false keyword matches
@@ -118,7 +119,7 @@ function scoreDomain(
     const triggers = action.triggers ?? [];
     let hasTriggerMatch = false;
     for (const trigger of triggers) {
-      if (q.includes(trigger)) {
+      if (fullText.includes(trigger)) {
         actionScore += 2;
         hasTriggerMatch = true;
       }
@@ -322,6 +323,9 @@ export async function probeConductor(
   const query = getLastUserText(messages).slice(0, 500).trim();
   if (!query) return { matched: false };
 
+  // Full text for trigger matching — triggers can appear anywhere in a long prompt
+  const fullText = getLastUserText(messages).toLowerCase();
+
   const domainsDir = cfg.domainsDir;
   if (!fs.existsSync(domainsDir)) {
     log('conductor probe: domains dir not found', { dir: domainsDir });
@@ -352,7 +356,7 @@ export async function probeConductor(
     const manifest = loadManifest(path.join(domainsDir, domainId));
     if (!manifest) continue;
 
-    const { score, matchedActionId } = scoreDomain(query, manifest);
+    const { score, matchedActionId } = scoreDomain(query, manifest, fullText);
 
     if (score > 0 && (!bestDomain || score > bestDomain.score)) {
       bestDomain = { id: domainId, manifest, score, matchedActionId };

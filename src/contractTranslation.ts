@@ -52,12 +52,15 @@ export interface TranslationResult {
  * Excluded by default (with reasons):
  *   - message: denied by 57/59 cloud agents; per-agent opt-in
  *   - cron: blocks gateway event loop
- *   - edit: risky with hallucinated oldText on small models
- *   - exec: system-level, dangerous with hallucinated args
  *   - web_search / web_fetch / browser: group:web, not locally meaningful
  *   - image_generate / video_generate / tts / music_generate: group:ui
  *   - sessions_*: group:sessions, orchestration
  *   - gateway / nodes: admin/device tools, explicitly denied by all agents
+ *
+ * NOTE: edit, apply_patch, exec, and process are now included because they
+ * are essential for agent functionality. The previous exclusion caused
+ * 78 of 84 tools to be stripped, making the router effectively useless
+ * for OpenClaw agents that depend on these tools.
  */
 export const DEFAULT_LOCAL_SURFACE: string[] = [
   'memory_search',
@@ -65,6 +68,10 @@ export const DEFAULT_LOCAL_SURFACE: string[] = [
   'update_plan',
   'read',
   'write',
+  'edit',
+  'apply_patch',
+  'exec',
+  'process',
 ];
 
 // ---------------------------------------------------------------------------

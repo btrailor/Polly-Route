@@ -1,19 +1,75 @@
 import http from 'http';
+import fs from 'fs';
+import path from 'path';
 import { loadConfig } from './config.js';
 import { classifyComplexity, getLastUserMessage } from './classifier.js';
 import { probeVault } from './vault.js';
+import { probeSkillCoverage } from './skillCoverage.js';
+import { probeConductor } from './conductorProbe.js';
 import { buildChain } from './router.js';
+import { captureCloudResponse } from './capture.js';
 import { estimateCost } from './cost.js';
 import { record, recent, stats } from './log.js';
 import { recordRequest, budgetStatus } from './budget.js';
-import { RequestBody } from './types.js';
+import { metricsSnapshot, metricsTimeSeries, recordRoutingDecision } from './metrics.js';
+import { recordReliability, gcReliability, recordLocalSuccess } from './reliability.js';
+import { classifyForReliability, getReliabilityDiagnostics, reliabilityGuardActive } from './reliabilityGuard.js';
+import { RequestBody, RoutingTarget, ConfidenceSignal, ConductorSignal } from './types.js';
+import { scoreResponse } from './confidenceScorer.js';
 import { contractTranslate, DEFAULT_LOCAL_SURFACE } from './contractTranslation.js';
+import { loadModesConfig } from './modes/loader.js';
+import { resolveMode, RequestMetadata } from './modes/resolver.js';
+import { applyModeToRequest, AgentToolPolicy } from './modes/apply.js';
+import { findModeCommandInMessages } from './modes/parser.js';
+import { ModesConfig } from './modes/schema.js';
 
 const config = loadConfig();
+const modesConfig: ModesConfig = loadModesConfig();
+let reliabilityActive = false;
+let reliabilityDiagnostics: Awaited<ReturnType<typeof getReliabilityDiagnostics>> | null = null;
 
 function log(msg: string, meta?: object) {
   const s = meta ? ' ' + JSON.stringify(meta) : '';
   console.log(`[${new Date().toISOString()}] ${msg}${s}`);
+}
+
+/**
+ * Extract a persona identifier from the request body.
+ *
+ * Looks at:
+ * 1. body.metadata.persona (OpenClaw agent convention)
+ * 2. body.agent.name / body.agent.id
+ * 3. Falls back to "default" so reliability can still aggregate per-task.
+ */
+function extractPersona(body: RequestBody): string {
+  if (typeof body.metadata === 'object' && body.metadata !== null) {
+    const persona = (body.metadata as Record<string, unknown>).persona;
+    if (typeof persona === 'string' && persona) return persona;
+  }
+  if (typeof body.agent === 'object' && body.agent !== null) {
+    const agentName = (body.agent as Record<string, unknown>).name;
+    if (typeof agentName === 'string' && agentName) return agentName;
+    const agentId = (body.agent as Record<string, unknown>).id;
+    if (typeof agentId === 'string' && agentId) return agentId;
+  }
+  return 'default';
+}
+
+/**
+ * Classify a task type from the last user message.
+ *
+ * This is intentionally coarse — the reliability loop only needs enough
+ * granularity to detect when a persona repeatedly fails on a category of
+ * work, not a perfect semantic label.
+ */
+function classifyTaskType(userText: string): string {
+  const text = userText.toLowerCase();
+  if (/\b(code|refactor|debug|implement|script|function|bug|fix)\b/.test(text)) return 'coding';
+  if (/\b(write|draft|edit|summarize|outline|note|blog|email|memo)\b/.test(text)) return 'writing';
+  if (/\b(plan|schedule|reminder|calendar|sprint|todo|task)\b/.test(text)) return 'planning';
+  if (/\b(research|investigate|compare|explain|what|how|why|who|when)\b/.test(text)) return 'research';
+  if (/\b(config|setup|install|deploy|env|service|systemd|nginx|crontab)\b/.test(text)) return 'infra';
+  return 'general';
 }
 
 async function readBody(req: http.IncomingMessage): Promise<string> {
@@ -133,22 +189,112 @@ async function handleCompletions(req: http.IncomingMessage, res: http.ServerResp
   }
 
 
-  // TEMP: log incoming request shape for debugging
-  log('incoming-request', {
-    toolCount: body.tools?.length ?? 0,
-    toolNames: (body.tools ?? []).map((t: any) => t.function?.name),
-    systemPromptPreview: (body.messages?.find((m: any) => m.role === 'system')?.content as string ?? '').slice(0, 300),
-    messageCount: body.messages?.length ?? 0,
-  });
+  // --- Mode resolution ---
+  // Check for /mode commands before any routing logic.
+  // Cast messages to the simpler mode-resolver shape (content: string | null).
+  const modeMessages = (body.messages ?? []) as unknown as Array<{ role: string; content?: string | null }>;
+  const modeCmd = findModeCommandInMessages(modeMessages);
 
-  const complexity  = classifyComplexity(body.messages ?? []);
-  const userMsg     = getLastUserMessage(body.messages ?? []);
-  const vaultSignal = await probeVault(body.messages ?? [], config);
+  // /mode list — return available modes as a JSON response.
+  if (modeCmd?.list) {
+    const modes = Object.entries(modesConfig.modes).map(([id, m]) => ({
+      id,
+      name: m.name,
+      description: m.description,
+    }));
+    return sendJson(res, 200, {
+      object: 'mode.list',
+      defaultMode: modesConfig.defaultMode,
+      modes,
+    });
+  }
 
-  log('dispatch', { complexity, vault: vaultSignal.confidence, vaultScore: vaultSignal.score.toFixed(2) });
+  // /mode reset — clear metadata.mode so resolution falls through to env/default.
+  let metadata: RequestMetadata | undefined;
+  if (typeof body.metadata === 'object' && body.metadata !== null) {
+    metadata = body.metadata as RequestMetadata;
+    if (modeCmd?.reset) {
+      delete (metadata as Record<string, unknown>).mode;
+    }
+  } else if (modeCmd?.reset) {
+    // Reset requested but no metadata object present: create an empty metadata
+    // container so resolveMode sees no mode override and falls back to env/default.
+    metadata = {};
+  } else {
+    metadata = body.metadata as RequestMetadata | undefined;
+  }
 
-  const chain = await buildChain(body, complexity, vaultSignal, config);
+  // Resolve the active mode for this request.
+  let resolvedModeId = 'default';
+  let resolvedProvenance = 'default';
+  let forcedTarget: RoutingTarget | undefined;
+  try {
+    const resolution = resolveMode(modesConfig, modeMessages, metadata, process.env, false);
+    resolvedModeId = resolution.modeId;
+    resolvedProvenance = resolution.provenance;
+
+    // Capture pre-application state so we can log what the mode changed.
+    const originalModel = body.model;
+    const originalToolNames = (body.tools ?? []).map((t: any) => t.function?.name).filter(Boolean);
+
+    // Apply mode overrides to the request body (model, tools, prompt, etc.).
+    const agentPolicy: AgentToolPolicy = {};
+    body = applyModeToRequest(resolution.mode, body as unknown as import('./modes/apply.js').RequestBody, agentPolicy) as unknown as RequestBody;
+
+    const appliedToolNames = (body.tools ?? []).map((t: any) => t.function?.name).filter(Boolean);
+    const removedTools = originalToolNames.filter((n: string) => !appliedToolNames.includes(n));
+    const modelChanged = originalModel !== body.model;
+
+    // Determine forced target from mode flags.
+    if (resolution.mode.flags.absolute) {
+      // Lockdown: force local, no cloud providers.
+      forcedTarget = 'LOCAL';
+    } else if (resolution.mode.routing.target === 'local') {
+      // Explicit local target: force LOCAL.
+      forcedTarget = 'LOCAL';
+    } else if (resolution.mode.routing.localFirst) {
+      // Local-first preference: hint the router but don't override.
+      // The router's existing logic will prefer local when it fits.
+      forcedTarget = undefined;
+    }
+
+    log('mode-resolved', {
+      mode: resolvedModeId,
+      provenance: resolvedProvenance,
+      forcedTarget: forcedTarget ?? null,
+      modelChanged,
+      model: body.model ?? null,
+      removedTools: removedTools.length ? removedTools : undefined,
+      temperature: body.temperature ?? null,
+    });
+  } catch (e) {
+    log('mode-resolution-failed', { error: (e as Error).message });
+  }
+
+  const complexity     = classifyComplexity(body.messages ?? []);
+  const userMsg        = getLastUserMessage(body.messages ?? []);
+  const vaultSignal    = await probeVault(body.messages ?? [], config);
+  const skillSignal    = await probeSkillCoverage(body.messages ?? [], config);
+  const conductorSignal = await probeConductor(body.messages ?? [], config);
+
+  log('dispatch', { complexity, vault: vaultSignal.confidence, vaultScore: vaultSignal.score.toFixed(2), skill: skillSignal.hasSkill ? (skillSignal.skillName ?? 'yes') : 'no', conductor: conductorSignal.matched ? (conductorSignal.domainId ?? 'yes') : 'no' });
+
+  const persona = extractPersona(body);
+  const taskType = classifyTaskType(userMsg);
+
+  const { target, chain } = await buildChain(body, complexity, vaultSignal, config, skillSignal, persona, taskType, forcedTarget, conductorSignal);
   const startMs = Date.now();
+
+  const triggerCapture = (provider: string, rawResponseText: string) => {
+    void captureCloudResponse({
+      body,
+      provider,
+      vaultSignal,
+      complexity,
+      target,
+      rawResponseText,
+    });
+  };
 
   // Token budgets by model (chars not tokens, ~4 chars/token)
   const LOCAL_BUDGETS: Record<string, number> = {
@@ -159,7 +305,8 @@ async function handleCompletions(req: http.IncomingMessage, res: http.ServerResp
   for (const entry of chain) {
     try {
       // Contract translation for local model dispatch (design.md I1–I7)
-      const isLocal = entry.name.startsWith('ollama/');
+      // Both Ollama and llama-server are local providers that need contract translation.
+      const isLocal = entry.name.startsWith('ollama/') || entry.name.startsWith('llamacpp/');
       const isCerebras = entry.name === 'cerebras';
       let dispatchBody = body;
 
@@ -215,6 +362,21 @@ async function handleCompletions(req: http.IncomingMessage, res: http.ServerResp
           upstream.on('data', c => chunks.push(c));
           upstream.on('end', () => resolve(Buffer.concat(chunks).toString()));
         });
+
+        // Classify the local failure for the reliability guard before falling back.
+        if (isLocal && persona && taskType) {
+          const { failureClass, countable } = await classifyForReliability(config, undefined, upstream.statusCode, errBody);
+          recordReliability({
+            ts: new Date().toISOString(),
+            persona,
+            task_type: taskType,
+            provider: entry.name,
+            success: false,
+            failure_class: failureClass,
+          }, config);
+          log('local-failure-classified', { provider: entry.name, persona, taskType, failureClass, counted: countable });
+        }
+
         log('dispatch error — trying next', { provider: entry.name, status: upstream.statusCode, body: errBody.slice(0, 200) });
         continue;
       }
@@ -227,6 +389,14 @@ async function handleCompletions(req: http.IncomingMessage, res: http.ServerResp
 
       // If client wants SSE but upstream returns JSON, wrap in SSE format
       if (clientWantsStream && !upstreamIsStream) {
+        // Confidence scoring metadata for SSE responses
+        const confidenceCfg = (config as any).confidence;
+        let confidenceScore: string | undefined;
+        let confidenceTier: string | undefined;
+        if (confidenceCfg?.enabled) {
+          // Defer scoring until we have the raw body (done in the 'end' handler below)
+        }
+
         res.writeHead(upstream.statusCode ?? 200, {
           'Content-Type': 'text/event-stream',
           'Cache-Control': 'no-cache',
@@ -280,10 +450,27 @@ async function handleCompletions(req: http.IncomingMessage, res: http.ServerResp
           res.write(streamChunk);
           res.end();
 
+          // Score the response for confidence (metadata only — can't escalate after sending)
+          if (confidenceCfg?.enabled) {
+            const signal = scoreResponse(raw, confidenceCfg);
+            log('confidence-score', {
+              provider: entry.name,
+              score: signal.score,
+              tier: signal.tier,
+              shouldEscalate: signal.shouldEscalate,
+              checks: signal.checks.map(c => ({ name: c.name, passed: c.passed })),
+            });
+          }
+
           const cost = estimateCost(entry.name, usage);
-          log('complete', { provider: entry.name, complexity, vault: vaultSignal.confidence, ms, costUsd: cost?.total?.toFixed(6) ?? '0' });
-          record({ ts: new Date().toISOString(), provider: entry.name, complexity, vault: vaultSignal.confidence, ms, costUsd: cost?.total ?? 0, inputTokens: usage?.prompt_tokens ?? 0, outputTokens: usage?.completion_tokens ?? 0 });
+          log('complete', { provider: entry.name, complexity, vault: vaultSignal.confidence, skill: skillSignal.hasSkill ? (skillSignal.skillName ?? 'yes') : 'no', ms, costUsd: cost?.total?.toFixed(6) ?? '0' });
+          record({ ts: new Date().toISOString(), provider: entry.name, complexity, vault: vaultSignal.confidence, skill: skillSignal.hasSkill, skillName: skillSignal.skillName, conductor: conductorSignal.matched, conductorDomain: conductorSignal.domainId, ms, costUsd: cost?.total ?? 0, inputTokens: usage?.prompt_tokens ?? 0, outputTokens: usage?.completion_tokens ?? 0 });
           recordRequest(entry.name);
+          recordRoutingDecision(complexity, vaultSignal.confidence, target, entry.name, 'success', skillSignal.hasSkill, skillSignal.skillName, conductorSignal.matched, conductorSignal.domainId);
+          if (entry.name.startsWith('ollama/') || entry.name.startsWith('llamacpp/')) {
+            recordLocalSuccess({ ts: new Date().toISOString(), persona, task_type: taskType, provider: entry.name }, config);
+          }
+          triggerCapture(entry.name, raw);
         });
         upstream.on('error', (e: Error) => {
           log('stream error', { provider: entry.name, error: e.message });
@@ -303,7 +490,7 @@ async function handleCompletions(req: http.IncomingMessage, res: http.ServerResp
       if (upstream.headers['transfer-encoding'] && !isLocal) headers['transfer-encoding'] = upstream.headers['transfer-encoding'] as string;
 
       if (isLocal) {
-        // Buffer local model response to allow tool-call rewriting
+        // Buffer local model response to allow tool-call rewriting and confidence scoring
         const rawChunks: Buffer[] = [];
         upstream.on('data', (c: Buffer) => rawChunks.push(c));
         upstream.on('end', () => {
@@ -311,12 +498,58 @@ async function handleCompletions(req: http.IncomingMessage, res: http.ServerResp
           const ms = Date.now() - startMs;
           let usage: { prompt_tokens?: number; completion_tokens?: number } | undefined;
           try { const p = JSON.parse(rawBody); usage = p.usage; } catch {}
+
+          // ── Confidence scoring: structural signal for router escalation ──
+          // Score the local model's output. If confidence is low and there
+          // are more providers in the chain, escalate to the next one
+          // instead of returning a potentially-wrong answer.
+          const confidenceCfg = (config as any).confidence;
+          if (confidenceCfg?.enabled) {
+            const signal = scoreResponse(rawBody, confidenceCfg);
+            log('confidence-score', {
+              provider: entry.name,
+              score: signal.score,
+              tier: signal.tier,
+              shouldEscalate: signal.shouldEscalate,
+              checks: signal.checks.map(c => ({ name: c.name, passed: c.passed })),
+            });
+
+            if (signal.shouldEscalate) {
+              // Low confidence: don't send this response. Try the next provider.
+              log('confidence-escalation', {
+                provider: entry.name,
+                score: signal.score,
+                detail: signal.checks.filter(c => !c.passed).map(c => c.name).join(','),
+              });
+              // Record as a soft failure for reliability tracking (not counted against persona)
+              if (persona && taskType) {
+                recordReliability({
+                  ts: new Date().toISOString(),
+                  persona,
+                  task_type: taskType,
+                  provider: entry.name,
+                  success: false,
+                  failure_class: 'ambiguous',
+                }, config);
+              }
+              // Continue to the next provider in the chain
+              return;
+            }
+
+            // Add confidence headers to the response
+            headers['X-Polly-Confidence'] = signal.score.toFixed(2);
+            headers['X-Polly-Confidence-Tier'] = signal.tier;
+          }
+
           res.writeHead(upstream.statusCode ?? 200, { ...headers, 'content-length': Buffer.byteLength(rawBody).toString() });
           res.end(rawBody);
           const cost = estimateCost(entry.name, usage);
-          log('complete', { provider: entry.name, complexity, vault: vaultSignal.confidence, ms, costUsd: cost?.total?.toFixed(6) ?? '0' });
-          record({ ts: new Date().toISOString(), provider: entry.name, complexity, vault: vaultSignal.confidence, ms, costUsd: cost?.total ?? 0, inputTokens: usage?.prompt_tokens ?? 0, outputTokens: usage?.completion_tokens ?? 0 });
+          log('complete', { provider: entry.name, complexity, vault: vaultSignal.confidence, skill: skillSignal.hasSkill ? (skillSignal.skillName ?? 'yes') : 'no', ms, costUsd: cost?.total?.toFixed(6) ?? '0' });
+          record({ ts: new Date().toISOString(), provider: entry.name, complexity, vault: vaultSignal.confidence, skill: skillSignal.hasSkill, skillName: skillSignal.skillName, conductor: conductorSignal.matched, conductorDomain: conductorSignal.domainId, ms, costUsd: cost?.total ?? 0, inputTokens: usage?.prompt_tokens ?? 0, outputTokens: usage?.completion_tokens ?? 0 });
           recordRequest(entry.name);
+          recordRoutingDecision(complexity, vaultSignal.confidence, target, entry.name, 'success', skillSignal.hasSkill, skillSignal.skillName, conductorSignal.matched, conductorSignal.domainId);
+          recordLocalSuccess({ ts: new Date().toISOString(), persona, task_type: taskType, provider: entry.name }, config);
+          triggerCapture(entry.name, rawBody);
         });
         upstream.on('error', (e: Error) => { log('stream error', { provider: entry.name, error: e.message }); if (!res.writableEnded) res.end(); });
         return;
@@ -341,18 +574,26 @@ async function handleCompletions(req: http.IncomingMessage, res: http.ServerResp
         } catch {}
 
         const cost = estimateCost(entry.name, usage);
-        log('complete', { provider: entry.name, complexity, vault: vaultSignal.confidence, ms, costUsd: cost?.total?.toFixed(6) ?? '0' });
+        log('complete', { provider: entry.name, complexity, vault: vaultSignal.confidence, skill: skillSignal.hasSkill ? (skillSignal.skillName ?? 'yes') : 'no', ms, costUsd: cost?.total?.toFixed(6) ?? '0' });
 
         record({
           ts: new Date().toISOString(),
           provider: entry.name,
           complexity,
           vault: vaultSignal.confidence,
+          skill: skillSignal.hasSkill,
+          skillName: skillSignal.skillName,
+          conductor: conductorSignal.matched,
+          conductorDomain: conductorSignal.domainId,
           ms,
           costUsd: cost?.total ?? 0,
           inputTokens: usage?.prompt_tokens ?? 0,
           outputTokens: usage?.completion_tokens ?? 0,
         });
+
+        recordRequest(entry.name);
+        recordRoutingDecision(complexity, vaultSignal.confidence, target, entry.name, 'success', skillSignal.hasSkill, skillSignal.skillName);
+        triggerCapture(entry.name, rawBody);
       });
 
       upstream.on('error', (e: Error) => {
@@ -363,11 +604,42 @@ async function handleCompletions(req: http.IncomingMessage, res: http.ServerResp
       return;
 
     } catch (e: unknown) {
+      // Classify exceptions thrown by the provider chain. For local providers,
+      // this feeds the persona reliability guard so config failures are not
+      // counted against the model.
+      if (persona && taskType && (entry.name.startsWith('ollama/') || entry.name.startsWith('llamacpp/'))) {
+        const { failureClass, countable } = await classifyForReliability(config, e);
+        recordReliability({
+          ts: new Date().toISOString(),
+          persona,
+          task_type: taskType,
+          provider: entry.name,
+          success: false,
+          failure_class: failureClass,
+        }, config);
+        log('local-failure-classified', { provider: entry.name, persona, taskType, failureClass, counted: countable });
+      }
+
       log('dispatch error — trying next', { provider: entry.name, error: (e as Error).message });
     }
   }
 
   sendJson(res, 502, { error: { message: 'All providers failed' } });
+  recordRoutingDecision(complexity, vaultSignal.confidence, target, chain[chain.length - 1]?.name ?? 'none', 'error', skillSignal.hasSkill, skillSignal.skillName, conductorSignal.matched, conductorSignal.domainId);
+
+  // If the final provider was local, also log a reliability failure so the
+  // persona track record reflects that no provider could satisfy the request.
+  const lastLocal = chain[chain.length - 1]?.name?.startsWith('ollama/') || chain[chain.length - 1]?.name?.startsWith('llamacpp/');
+  if (lastLocal && persona && taskType) {
+    recordReliability({
+      ts: new Date().toISOString(),
+      persona,
+      task_type: taskType,
+      provider: chain[chain.length - 1].name,
+      success: false,
+      failure_class: 'ambiguous',
+    }, config);
+  }
 }
 
 function handleModels(_req: http.IncomingMessage, res: http.ServerResponse) {
@@ -378,13 +650,45 @@ function handleModels(_req: http.IncomingMessage, res: http.ServerResponse) {
 }
 
 function handleStatus(_req: http.IncomingMessage, res: http.ServerResponse) {
-  sendJson(res, 200, { status: 'ok', uptime: process.uptime(), ...stats(), budget: budgetStatus() });
+  sendJson(res, 200, {
+    status: 'ok',
+    uptime: process.uptime(),
+    ...stats(),
+    budget: budgetStatus(),
+    metrics: metricsSnapshot(),
+    reliability: {
+      enabled: config.reliability?.enabled ?? false,
+      active: reliabilityActive,
+      diagnostics: reliabilityDiagnostics,
+    },
+    confidence: {
+      enabled: config.confidence?.enabled ?? false,
+      escalationThreshold: config.confidence?.escalationThreshold ?? 0.45,
+    },
+  });
+}
+
+function handleMetrics(_req: http.IncomingMessage, res: http.ServerResponse) {
+  sendJson(res, 200, metricsTimeSeries());
 }
 
 function handleLog(req: http.IncomingMessage, res: http.ServerResponse) {
   const url = new URL(req.url ?? '/', 'http://localhost');
   const limit = Math.min(parseInt(url.searchParams.get('limit') ?? '50'), 200);
   sendJson(res, 200, { ...stats(), entries: recent(limit) });
+}
+
+/** Serve the static metrics dashboard HTML. Works from both src/ (ts-node) and dist/. */
+function handleDashboard(_req: http.IncomingMessage, res: http.ServerResponse) {
+  const filePath = path.join(__dirname, '..', 'dashboard.html');
+  fs.readFile(filePath, 'utf-8', (err, html) => {
+    if (err) {
+      sendJson(res, 500, { error: { message: 'Dashboard not available' } });
+      return;
+    }
+    res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+    res.end(html);
+  });
 }
 
 const server = http.createServer(async (req, res) => {
@@ -396,6 +700,8 @@ const server = http.createServer(async (req, res) => {
   if (req.method === 'POST' && url === '/v1/chat/completions') return handleCompletions(req, res);
   if (req.method === 'GET'  && url === '/v1/models')           return handleModels(req, res);
   if (req.method === 'GET'  && (url === '/status' || url === '/health')) return handleStatus(req, res);
+  if (req.method === 'GET'  && url === '/metrics')           return handleMetrics(req, res);
+  if (req.method === 'GET'  && url === '/dashboard')         return handleDashboard(req, res);
   if (req.method === 'GET'  && url.startsWith('/log'))         return handleLog(req, res);
   sendJson(res, 404, { error: { message: 'Not found' } });
 });
@@ -404,26 +710,16 @@ server.listen(config.port, '127.0.0.1', async () => {
   log(`polly-route v0.6 listening on http://127.0.0.1:${config.port}`);
   log('providers', { available: Object.keys(config.providers).filter(k => !!(config.providers as any)[k]) });
   log('ollama', { models: config.ollama.models.map(m => m.id) });
-  log('qmd', { url: config.qmd.baseUrl });
+  log('llamacpp', { endpoints: (config.llamacpp?.endpoints ?? []).map(e => `${e.model}@${e.baseUrl}`) });
 
-  // 0a.6 — QMD daemon boot check
+  // 0a.7 — Reliability guard boot check (off by default; diagnostics surfaced on /status)
   try {
-    const qmdRes = await new Promise<boolean>((resolve) => {
-      const req = http.request({
-        hostname: 'localhost',
-        port: 8181,
-        path: '/query',
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json', 'Content-Length': 2 },
-      }, (res) => { resolve(res.statusCode === 200); res.resume(); });
-      req.on('error', () => resolve(false));
-      req.setTimeout(1500, () => { req.destroy(); resolve(false); });
-      req.write('{}');
-      req.end();
-    });
-    log(`[boot] QMD daemon reachable: ${qmdRes ? 'yes' : 'NO — vault probe will return ABSENT until daemon starts'}`);
-  } catch {
-    log('[boot] QMD daemon reachable: NO — vault probe will return ABSENT until daemon starts');
+    reliabilityDiagnostics = await getReliabilityDiagnostics(config);
+    reliabilityActive = await reliabilityGuardActive(config);
+    log('[boot] reliability guard', { active: reliabilityActive, details: reliabilityDiagnostics.details });
+  } catch (e) {
+    log('[boot] reliability guard check failed', { error: (e as Error).message });
+    reliabilityActive = false;
   }
 });
 

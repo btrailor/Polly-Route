@@ -308,8 +308,8 @@ describe('DEFAULT_LOCAL_SURFACE', () => {
     expect(DEFAULT_LOCAL_SURFACE).not.toContain('cron');
   });
 
-  test('does not contain exec', () => {
-    expect(DEFAULT_LOCAL_SURFACE).not.toContain('exec');
+  test('contains exec (essential for agent filesystem/system work)', () => {
+    expect(DEFAULT_LOCAL_SURFACE).toContain('exec');
   });
 
   test('does not contain message (per-agent opt-in only)', () => {

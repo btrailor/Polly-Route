@@ -1,6 +1,7 @@
-import { describe, test, expect, jest, beforeEach } from '@jest/globals';
-import { Complexity, VaultSignal, RequestBody } from '../src/types';
+import { describe, test, expect, jest } from '@jest/globals';
+import { Complexity, VaultSignal, RequestBody, VaultConfidence, SkillSignal } from '../src/types';
 import { Config, OllamaModel } from '../src/config';
+import { buildChain, decideTarget } from '../src/router';
 
 // ─── Minimal config for testing ────────────────────────────────────────────
 
@@ -32,11 +33,17 @@ function makeVault(confidence: VaultSignal['confidence'], score = 0.9): VaultSig
   return { confidence, score, chunks: confidence !== 'ABSENT' ? ['vault chunk'] : [] };
 }
 
+function makeSkill(name: string, procedure: string, score = 5): SkillSignal {
+  return { hasSkill: true, skillName: name, procedure, score };
+}
+
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
 // We need to mock OllamaAdapter.isAvailable to return true without network calls.
 // We also need to capture chain names without dispatching.
 // Strategy: import buildChain and mock the OllamaAdapter prototype.
+
+let lastDispatchBody: RequestBody | null = null;
 
 jest.mock('../src/providers/ollama', () => {
   const actual = jest.requireActual('../src/providers/ollama') as any;
@@ -44,6 +51,7 @@ jest.mock('../src/providers/ollama', () => {
     OllamaAdapter: class MockOllama extends actual.OllamaAdapter {
       async isAvailable() { return true; }
       async dispatch(model: any, body: any) {
+        lastDispatchBody = body;
         throw new Error('dispatch not called in routing tests');
       }
     },
@@ -55,21 +63,55 @@ jest.mock('../src/providers/copilot', () => ({
   copilotAdapter: () => async () => { throw new Error('copilot not dispatched in tests'); },
 }));
 
-import { buildChain } from '../src/router';
+function names(chain: { name: string }[]) {
+  return chain.map(e => {
+    if (e.name.startsWith('ollama/')) return 'ollama';
+    return e.name;
+  });
+}
 
-// ─── Tests ───────────────────────────────────────────────────────────────────
+// ─── Unit tests for the coverage-vs-complexity matrix decision ───────────────
+
+describe('decideTarget coverage-vs-complexity matrix', () => {
+  const fits = true;
+  const nofit = false;
+
+  const cases: { vault: VaultConfidence; complexity: Complexity; fits: boolean; expected: string }[] = [
+    { vault: 'DIRECT',  complexity: 'LIGHT',  fits,      expected: 'LOCAL' },
+    { vault: 'DIRECT',  complexity: 'MEDIUM', fits,      expected: 'LOCAL' },
+    { vault: 'DIRECT',  complexity: 'HEAVY',  fits,      expected: 'LOCAL' },
+    { vault: 'DIRECT',  complexity: 'HEAVY',  fits: nofit, expected: 'CLOUD' },
+    { vault: 'ADJACENT', complexity: 'LIGHT',  fits,      expected: 'LOCAL' },
+    { vault: 'ADJACENT', complexity: 'MEDIUM', fits,      expected: 'LOCAL+CTX' },
+    { vault: 'ADJACENT', complexity: 'MEDIUM', fits: nofit, expected: 'CLOUD' },
+    { vault: 'ADJACENT', complexity: 'HEAVY',  fits,      expected: 'CLOUD' },
+    { vault: 'ABSENT',   complexity: 'LIGHT',  fits,      expected: 'LOCAL' },
+    { vault: 'ABSENT',   complexity: 'LIGHT',  fits: nofit, expected: 'CLOUD' },
+    { vault: 'ABSENT',   complexity: 'MEDIUM', fits,      expected: 'CLOUD' },
+    { vault: 'ABSENT',   complexity: 'HEAVY',  fits,      expected: 'CLOUD' },
+  ];
+
+  test.each(cases)(
+    '$vault + $complexity (fits=$fits) → $expected',
+    ({ vault, complexity, fits: f, expected }) => {
+      expect(decideTarget(complexity, makeVault(vault), f)).toBe(expected);
+    }
+  );
+});
+
+// ─── Tests for buildChain output ─────────────────────────────────────────────
 
 describe('routing matrix — chain order', () => {
-  // Helper: extract provider name prefix from chain
-  function names(chain: { name: string }[]) {
-    return chain.map(e => {
-      if (e.name.startsWith('ollama/')) return 'ollama';
-      return e.name;
-    });
-  }
+  test('buildChain returns target alongside chain', async () => {
+    const result = await buildChain(SMALL_BODY, 'MEDIUM', makeVault('ABSENT'), TEST_CONFIG);
+    expect(result).toHaveProperty('target');
+    expect(result).toHaveProperty('chain');
+    expect(Array.isArray(result.chain)).toBe(true);
+    expect(result.target).toBe('CLOUD');
+  });
 
-  test('LIGHT + DIRECT — ollama first, then cloud', async () => {
-    const chain = await buildChain(SMALL_BODY, 'LIGHT', makeVault('DIRECT'), TEST_CONFIG);
+  test('LIGHT + DIRECT — local first', async () => {
+    const { chain } = await buildChain(SMALL_BODY, 'LIGHT', makeVault('DIRECT'), TEST_CONFIG);
     const ns = names(chain);
     expect(ns[0]).toBe('ollama');
     expect(ns).toContain('google');
@@ -77,22 +119,23 @@ describe('routing matrix — chain order', () => {
   });
 
   test('MEDIUM + DIRECT — min 32b local first, then cloud', async () => {
-    const chain = await buildChain(SMALL_BODY, 'MEDIUM', makeVault('DIRECT'), TEST_CONFIG);
-    expect(chain[0].name).toBe('ollama/qwen2.5-coder:32b'); // min 32b enforced
+    const { chain } = await buildChain(SMALL_BODY, 'MEDIUM', makeVault('DIRECT'), TEST_CONFIG);
+    expect(chain[0].name).toBe('ollama/qwen2.5-coder:32b');
     expect(names(chain)).toContain('google');
     expect(names(chain)).toContain('groq');
   });
 
-  test('HEAVY + DIRECT — cloud first (too complex for local), vault context injected', async () => {
-    const chain = await buildChain(SMALL_BODY, 'HEAVY', makeVault('DIRECT'), TEST_CONFIG);
+  test('HEAVY + DIRECT — local first (frontier-gate: DIRECT covers heavy)', async () => {
+    const { chain } = await buildChain(SMALL_BODY, 'HEAVY', makeVault('DIRECT'), TEST_CONFIG);
     const ns = names(chain);
-    expect(ns[0]).not.toBe('ollama');   // cloud first
-    expect(ns).toContain('copilot');    // copilot in chain
-    expect(ns).not.toContain('ollama'); // no local at all for HEAVY
+    expect(ns[0]).toBe('ollama');
+    expect(chain[0].name).toBe('ollama/qwen2.5:72b');
+    expect(ns).toContain('google');
+    expect(ns).toContain('groq');
   });
 
-  test('LIGHT + ADJACENT — local first, then groq, cerebras, mistral, google', async () => {
-    const chain = await buildChain(SMALL_BODY, 'LIGHT', makeVault('ADJACENT'), TEST_CONFIG);
+  test('LIGHT + ADJACENT — local first, then cloud', async () => {
+    const { chain } = await buildChain(SMALL_BODY, 'LIGHT', makeVault('ADJACENT'), TEST_CONFIG);
     const ns = names(chain);
     expect(ns[0]).toBe('ollama');
     expect(ns).toContain('groq');
@@ -101,41 +144,45 @@ describe('routing matrix — chain order', () => {
     expect(ns).toContain('google');
   });
 
-  test('MEDIUM + ADJACENT — google first, then groq, then local', async () => {
-    const chain = await buildChain(SMALL_BODY, 'MEDIUM', makeVault('ADJACENT'), TEST_CONFIG);
+  test('MEDIUM + ADJACENT — LOCAL+CTX, local first with vault context', async () => {
+    const { chain } = await buildChain(SMALL_BODY, 'MEDIUM', makeVault('ADJACENT'), TEST_CONFIG);
     const ns = names(chain);
-    expect(ns[0]).toBe('google');
-    expect(ns[1]).toBe('groq');
-    expect(ns).toContain('ollama');
+    expect(ns[0]).toBe('ollama');
+    expect(chain[0].name).toBe('ollama/qwen2.5-coder:32b');
+    expect(ns).toContain('google');
+    expect(ns).toContain('groq');
   });
 
-  test('HEAVY + ADJACENT — google first, groq second, copilot last', async () => {
-    const chain = await buildChain(SMALL_BODY, 'HEAVY', makeVault('ADJACENT'), TEST_CONFIG);
+  test('HEAVY + ADJACENT — cloud first, no local', async () => {
+    const { chain } = await buildChain(SMALL_BODY, 'HEAVY', makeVault('ADJACENT'), TEST_CONFIG);
     const ns = names(chain);
     expect(ns[0]).toBe('google');
     expect(ns[1]).toBe('groq');
+    expect(ns).not.toContain('ollama');
     expect(ns).toContain('copilot');
   });
 
-  test('LIGHT + ABSENT — groq first, no local', async () => {
-    const chain = await buildChain(SMALL_BODY, 'LIGHT', makeVault('ABSENT'), TEST_CONFIG);
+  test('LIGHT + ABSENT — local first (simple enough without vault)', async () => {
+    const { chain } = await buildChain(SMALL_BODY, 'LIGHT', makeVault('ABSENT'), TEST_CONFIG);
     const ns = names(chain);
-    expect(ns[0]).toBe('groq');
+    expect(ns[0]).toBe('ollama');
+    expect(ns).toContain('groq');
+  });
+
+  test('MEDIUM + ABSENT — cloud first, no local', async () => {
+    const { chain } = await buildChain(SMALL_BODY, 'MEDIUM', makeVault('ABSENT'), TEST_CONFIG);
+    const ns = names(chain);
+    expect(ns[0]).toBe('google');
+    expect(ns).toContain('groq');
     expect(ns).not.toContain('ollama');
   });
 
-  test('MEDIUM + ABSENT — groq first, google second, no local', async () => {
-    const chain = await buildChain(SMALL_BODY, 'MEDIUM', makeVault('ABSENT'), TEST_CONFIG);
+  test('HEAVY + ABSENT — cloud first, no local', async () => {
+    const { chain } = await buildChain(SMALL_BODY, 'HEAVY', makeVault('ABSENT'), TEST_CONFIG);
     const ns = names(chain);
-    expect(ns[0]).toBe('groq');
-    expect(ns[1]).toBe('google');
+    expect(ns[0]).toBe('google');
     expect(ns).not.toContain('ollama');
-  });
-
-  test('HEAVY + ABSENT — copilot first', async () => {
-    const chain = await buildChain(SMALL_BODY, 'HEAVY', makeVault('ABSENT'), TEST_CONFIG);
-    expect(names(chain)[0]).toBe('copilot');
-    expect(names(chain)).not.toContain('ollama');
+    expect(ns).toContain('copilot');
   });
 
   test('no cell produces an empty chain', async () => {
@@ -145,9 +192,24 @@ describe('routing matrix — chain order', () => {
       ['HEAVY','DIRECT'],['HEAVY','ADJACENT'],['HEAVY','ABSENT'],
     ];
     for (const [c, v] of combos) {
-      const chain = await buildChain(SMALL_BODY, c, makeVault(v), TEST_CONFIG);
+      const { chain } = await buildChain(SMALL_BODY, c, makeVault(v), TEST_CONFIG);
       expect(chain.length).toBeGreaterThan(0);
     }
+  });
+
+  // Acceptance criteria from R3-A card.
+  test('ACCEPTANCE: {vault: DIRECT, complexity: HEAVY} → returns local chain', async () => {
+    const { chain } = await buildChain(SMALL_BODY, 'HEAVY', makeVault('DIRECT'), TEST_CONFIG);
+    expect(names(chain)[0]).toBe('ollama');
+  });
+
+  test('ACCEPTANCE: {vault: ABSENT, complexity: MEDIUM} → returns cloud chain', async () => {
+    const { chain } = await buildChain(SMALL_BODY, 'MEDIUM', makeVault('ABSENT'), TEST_CONFIG);
+    const ns = names(chain);
+    expect(ns[0]).not.toBe('ollama');
+    expect(ns).toContain('google');
+    expect(ns).toContain('groq');
+    expect(ns).not.toContain('ollama');
   });
 });
 
@@ -167,11 +229,10 @@ describe('router body honesty', () => {
     // Capture what body each chain entry receives
     const capturedBodies: RequestBody[] = [];
     const vault = makeVault('DIRECT');
-    const chain = await buildChain(body, 'LIGHT', vault, TEST_CONFIG);
+    const { chain } = await buildChain(body, 'LIGHT', vault, TEST_CONFIG);
 
     // Replace chain fns with capture fns
     for (const entry of chain) {
-      const original = entry.fn;
       entry.fn = async (b: RequestBody) => {
         capturedBodies.push(b);
         throw new Error('stop');
@@ -188,5 +249,75 @@ describe('router body honesty', () => {
       // Tools untouched
       expect(captured.tools).toEqual(body.tools);
     }
+  });
+});
+
+// ─── Skill coverage probe integration ───────────────────────────────────────
+
+describe('skill coverage fills vault gaps', () => {
+  const skill = makeSkill('scope-a-sprint', '## Scope-a-sprint procedure\nUse the seven-section brief.');
+
+  test('ACCEPTANCE: ABSENT vault + hasSkill=true → routes to LOCAL for LIGHT', async () => {
+    const { target, chain } = await buildChain(SMALL_BODY, 'LIGHT', makeVault('ABSENT'), TEST_CONFIG, skill);
+    expect(target).toBe('LOCAL');
+    expect(names(chain)[0]).toBe('ollama');
+  });
+
+  test('ACCEPTANCE: ABSENT vault + hasSkill=true → routes to LOCAL+CTX for MEDIUM', async () => {
+    const { target, chain } = await buildChain(SMALL_BODY, 'MEDIUM', makeVault('ABSENT'), TEST_CONFIG, skill);
+    expect(target).toBe('LOCAL+CTX');
+    expect(names(chain)[0]).toBe('ollama');
+  });
+
+  test('ABSENT vault + hasSkill=true + HEAVY → stays CLOUD', async () => {
+    const { target, chain } = await buildChain(SMALL_BODY, 'HEAVY', makeVault('ABSENT'), TEST_CONFIG, skill);
+    expect(target).toBe('CLOUD');
+    expect(names(chain)[0]).not.toBe('ollama');
+  });
+
+  test('ACCEPTANCE: skill procedure is injected alongside vault chunks', async () => {
+    lastDispatchBody = null;
+    const vault = makeVault('ADJACENT');
+    const { chain } = await buildChain(SMALL_BODY, 'MEDIUM', vault, TEST_CONFIG, skill);
+
+    // Trigger the local dispatch so the mocked adapter captures the body.
+    try { await chain[0].fn(SMALL_BODY); } catch {}
+
+    expect(lastDispatchBody).not.toBeNull();
+    const systemMsg = lastDispatchBody!.messages.find(m => m.role === 'system');
+    const systemText = typeof systemMsg?.content === 'string' ? systemMsg.content : '';
+    expect(systemText).toContain('vault chunk');
+    expect(systemText).toContain('scope-a-sprint');
+    expect(systemText).toContain('seven-section brief');
+  });
+});
+
+// ─── Unit tests for decideTarget with skill coverage ────────────────────────
+
+describe('decideTarget with skill coverage', () => {
+  const fits = true;
+  const nofit = false;
+  const skill = makeSkill('any', 'procedure');
+
+  test('ABSENT + hasSkill + LIGHT + fits → LOCAL', () => {
+    expect(decideTarget('LIGHT', makeVault('ABSENT'), fits, skill)).toBe('LOCAL');
+  });
+
+  test('ABSENT + hasSkill + MEDIUM + fits → LOCAL+CTX', () => {
+    expect(decideTarget('MEDIUM', makeVault('ABSENT'), fits, skill)).toBe('LOCAL+CTX');
+  });
+
+  test('ABSENT + hasSkill + HEAVY → CLOUD', () => {
+    expect(decideTarget('HEAVY', makeVault('ABSENT'), fits, skill)).toBe('CLOUD');
+  });
+
+  test('ABSENT + hasSkill + MEDIUM + nofit → CLOUD', () => {
+    expect(decideTarget('MEDIUM', makeVault('ABSENT'), nofit, skill)).toBe('CLOUD');
+  });
+
+  test('ABSENT + noSkill → behaves like original matrix', () => {
+    expect(decideTarget('LIGHT', makeVault('ABSENT'), fits)).toBe('LOCAL');
+    expect(decideTarget('MEDIUM', makeVault('ABSENT'), fits)).toBe('CLOUD');
+    expect(decideTarget('HEAVY', makeVault('ABSENT'), fits)).toBe('CLOUD');
   });
 });
