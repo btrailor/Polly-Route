@@ -478,7 +478,9 @@ async function handleCompletions(req: http.IncomingMessage, res: http.ServerResp
           log('complete', { provider: entry.name, complexity, vault: vaultSignal.confidence, skill: skillSignal.hasSkill ? (skillSignal.skillName ?? 'yes') : 'no', ms, costUsd: cost?.total?.toFixed(6) ?? '0' });
           record({ ts: new Date().toISOString(), provider: entry.name, complexity, vault: vaultSignal.confidence, skill: skillSignal.hasSkill, skillName: skillSignal.skillName, conductor: conductorSignal.matched, conductorDomain: conductorSignal.domainId, ms, costUsd: cost?.total ?? 0, inputTokens: usage?.prompt_tokens ?? 0, outputTokens: usage?.completion_tokens ?? 0 });
           recordRequest(entry.name);
-          recordRoutingDecision(complexity, vaultSignal.confidence, target, entry.name, 'success', skillSignal.hasSkill, skillSignal.skillName, conductorSignal.matched, conductorSignal.domainId);
+          recordRoutingDecision(complexity, vaultSignal.confidence, target, entry.name, 'success', skillSignal.hasSkill, skillSignal.skillName, conductorSignal.matched, conductorSignal.domainId, {
+            ms, costUsd: cost?.total ?? 0, inputTokens: usage?.prompt_tokens ?? 0, outputTokens: usage?.completion_tokens ?? 0,
+          });
           if (entry.name.startsWith('ollama/') || entry.name.startsWith('llamacpp/')) {
             recordLocalSuccess({ ts: new Date().toISOString(), persona, task_type: taskType, provider: entry.name }, config);
           }
@@ -559,7 +561,9 @@ async function handleCompletions(req: http.IncomingMessage, res: http.ServerResp
           log('complete', { provider: entry.name, complexity, vault: vaultSignal.confidence, skill: skillSignal.hasSkill ? (skillSignal.skillName ?? 'yes') : 'no', ms, costUsd: cost?.total?.toFixed(6) ?? '0' });
           record({ ts: new Date().toISOString(), provider: entry.name, complexity, vault: vaultSignal.confidence, skill: skillSignal.hasSkill, skillName: skillSignal.skillName, conductor: conductorSignal.matched, conductorDomain: conductorSignal.domainId, ms, costUsd: cost?.total ?? 0, inputTokens: usage?.prompt_tokens ?? 0, outputTokens: usage?.completion_tokens ?? 0 });
           recordRequest(entry.name);
-          recordRoutingDecision(complexity, vaultSignal.confidence, target, entry.name, 'success', skillSignal.hasSkill, skillSignal.skillName, conductorSignal.matched, conductorSignal.domainId);
+          recordRoutingDecision(complexity, vaultSignal.confidence, target, entry.name, 'success', skillSignal.hasSkill, skillSignal.skillName, conductorSignal.matched, conductorSignal.domainId, {
+            ms, costUsd: cost?.total ?? 0, inputTokens: usage?.prompt_tokens ?? 0, outputTokens: usage?.completion_tokens ?? 0,
+          });
           recordLocalSuccess({ ts: new Date().toISOString(), persona, task_type: taskType, provider: entry.name }, config);
           triggerCapture(entry.name, rawBody);
         });
@@ -604,7 +608,9 @@ async function handleCompletions(req: http.IncomingMessage, res: http.ServerResp
         });
 
         recordRequest(entry.name);
-        recordRoutingDecision(complexity, vaultSignal.confidence, target, entry.name, 'success', skillSignal.hasSkill, skillSignal.skillName);
+        recordRoutingDecision(complexity, vaultSignal.confidence, target, entry.name, 'success', skillSignal.hasSkill, skillSignal.skillName, conductorSignal.matched, conductorSignal.domainId, {
+          ms, costUsd: cost?.total ?? 0, inputTokens: usage?.prompt_tokens ?? 0, outputTokens: usage?.completion_tokens ?? 0,
+        });
         triggerCapture(entry.name, rawBody);
       });
 

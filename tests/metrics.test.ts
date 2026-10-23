@@ -100,6 +100,57 @@ describe('metrics JSONL log and computations', () => {
     expect(snap.local_first_success_rate).toBe(0);
   });
 
+  test('breaks usage down per provider with local/cloud classification', () => {
+    recordRoutingDecision('LIGHT', 'DIRECT', 'LOCAL', 'ollama/qwen2.5:7b', 'success', undefined, undefined, undefined, undefined, {
+      ms: 100, costUsd: 0, inputTokens: 10, outputTokens: 5,
+    });
+    recordRoutingDecision('LIGHT', 'DIRECT', 'LOCAL', 'ollama/qwen2.5:7b', 'success', undefined, undefined, undefined, undefined, {
+      ms: 300, costUsd: 0, inputTokens: 20, outputTokens: 8,
+    });
+    recordRoutingDecision('HEAVY', 'ABSENT', 'CLOUD', 'ollamapro', 'success', undefined, undefined, undefined, undefined, {
+      ms: 900, costUsd: 0.25, inputTokens: 100, outputTokens: 50,
+    });
+    recordRoutingDecision('HEAVY', 'ABSENT', 'CLOUD', 'groq', 'error');
+
+    const snap = metricsSnapshot();
+    const byName = new Map(snap.providers.map(p => [p.provider, p]));
+
+    expect(snap.providers).toHaveLength(3);
+
+    const ollama = byName.get('ollama/qwen2.5:7b')!;
+    expect(ollama.requests).toBe(2);
+    expect(ollama.successes).toBe(2);
+    expect(ollama.errors).toBe(0);
+    expect(ollama.local).toBe(true);
+    expect(ollama.avgMs).toBeCloseTo(200);
+    expect(ollama.inputTokens).toBe(30);
+    expect(ollama.outputTokens).toBe(13);
+
+    const pro = byName.get('ollamapro')!;
+    expect(pro.local).toBe(false);
+    expect(pro.costUsd).toBeCloseTo(0.25);
+    expect(pro.avgMs).toBeCloseTo(900);
+
+    const groq = byName.get('groq')!;
+    expect(groq.errors).toBe(1);
+    expect(groq.avgMs).toBeNull();
+
+    expect(snap.total_cost_usd).toBeCloseTo(0.25);
+  });
+
+  test('exposes a window-wide provider rollup in the time series', () => {
+    recordRoutingDecision('LIGHT', 'DIRECT', 'LOCAL', 'ollama/qwen2.5:7b', 'success');
+    recordRoutingDecision('HEAVY', 'ABSENT', 'CLOUD', 'ollamapro', 'success', undefined, undefined, undefined, undefined, {
+      costUsd: 0.5,
+    });
+
+    const series = metricsTimeSeries();
+    expect(series.providers.length).toBeGreaterThanOrEqual(2);
+    expect(series.providers.map(p => p.provider)).toContain('ollamapro');
+    expect(series.summary.total_requests).toBe(2);
+    expect(series.total_cost_usd).toBeCloseTo(0.5);
+  });
+
   test('time-series returns one bucket per day for the last 7 days', () => {
     recordRoutingDecision('LIGHT', 'DIRECT', 'LOCAL', 'ollama/qwen2.5:7b', 'success');
     recordCapture('groq', 'knowledge_gap', 'MEDIUM', true);

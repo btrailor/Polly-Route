@@ -27,6 +27,14 @@ export interface RoutingDecisionEvent {
   conductor?: boolean;
   /** Domain id that matched, if any. */
   conductorDomain?: string;
+  /** Wall-clock latency of the dispatch, in milliseconds. */
+  ms?: number;
+  /** Estimated cost of the dispatch in USD. */
+  costUsd?: number;
+  /** Input tokens reported by the provider, when available. */
+  inputTokens?: number;
+  /** Output tokens reported by the provider, when available. */
+  outputTokens?: number;
 }
 
 export interface CaptureEvent {
@@ -46,6 +54,27 @@ export interface BloomEvent {
   notes_processed: number;
 }
 
+/** Per-provider usage rollup, used to answer "which providers are actually serving traffic". */
+export interface ProviderBreakdown {
+  provider: string;
+  /** Total routing decisions attributed to this provider. */
+  requests: number;
+  /** Decisions that returned a successful response. */
+  successes: number;
+  /** Decisions that ended in an error. */
+  errors: number;
+  /** True when the provider is a local backend (ollama/ or llamacpp/). */
+  local: boolean;
+  /** Summed estimated cost in USD. */
+  costUsd: number;
+  /** Mean latency in milliseconds, when timing was recorded. */
+  avgMs: number | null;
+  /** Summed input tokens, when the provider reported usage. */
+  inputTokens: number;
+  /** Summed output tokens, when the provider reported usage. */
+  outputTokens: number;
+}
+
 export interface MetricSnapshot {
   window_days: number;
   total_requests: number;
@@ -62,6 +91,10 @@ export interface MetricSnapshot {
   captured_notes: number;
   capture_rate: number | null;
   bloom_lag: number;
+  /** Per-provider usage rollup for the whole window. */
+  providers: ProviderBreakdown[];
+  /** Total estimated USD spend across all providers in the window. */
+  total_cost_usd: number;
 }
 
 export interface DailyBucket {
@@ -82,6 +115,10 @@ export interface DailyBucket {
   captures_attempted: number;
   bloom_lag: number;
   bloom_processed: number;
+  /** Per-provider usage rollup for this day. */
+  providers: ProviderBreakdown[];
+  /** Total estimated USD spend for this day. */
+  total_cost_usd: number;
 }
 
 // ---------------------------------------------------------------------------
@@ -175,6 +212,21 @@ interface Aggregate {
   capturedNotes: number;
   capturesAttempted: number;
   bloomProcessed: number;
+  /** Per-provider rollup accumulator. */
+  providerStats: Map<string, ProviderAccumulator>;
+  totalCostUsd: number;
+}
+
+/** Mutable per-provider counters used while folding events into an Aggregate. */
+interface ProviderAccumulator {
+  requests: number;
+  successes: number;
+  errors: number;
+  costUsd: number;
+  msTotal: number;
+  msCount: number;
+  inputTokens: number;
+  outputTokens: number;
 }
 
 function emptyAggregate(): Aggregate {
@@ -189,6 +241,8 @@ function emptyAggregate(): Aggregate {
     capturedNotes: 0,
     capturesAttempted: 0,
     bloomProcessed: 0,
+    providerStats: new Map(),
+    totalCostUsd: 0,
   };
 }
 
@@ -200,11 +254,52 @@ function isCloudProvider(provider: string): boolean {
   return !isLocalProvider(provider);
 }
 
+/** Fold one routing decision into the per-provider rollup. */
+function aggregateProvider(acc: Aggregate, ev: RoutingDecisionEvent): void {
+  const provider = ev.provider || 'none';
+  let stat = acc.providerStats.get(provider);
+  if (!stat) {
+    stat = { requests: 0, successes: 0, errors: 0, costUsd: 0, msTotal: 0, msCount: 0, inputTokens: 0, outputTokens: 0 };
+    acc.providerStats.set(provider, stat);
+  }
+  stat.requests += 1;
+  if (ev.outcome === 'success') stat.successes += 1;
+  if (ev.outcome === 'error') stat.errors += 1;
+  if (typeof ev.costUsd === 'number' && Number.isFinite(ev.costUsd)) {
+    stat.costUsd += ev.costUsd;
+    acc.totalCostUsd += ev.costUsd;
+  }
+  if (typeof ev.ms === 'number' && Number.isFinite(ev.ms)) {
+    stat.msTotal += ev.ms;
+    stat.msCount += 1;
+  }
+  if (typeof ev.inputTokens === 'number' && Number.isFinite(ev.inputTokens)) stat.inputTokens += ev.inputTokens;
+  if (typeof ev.outputTokens === 'number' && Number.isFinite(ev.outputTokens)) stat.outputTokens += ev.outputTokens;
+}
+
+/** Render the per-provider rollup as a stable, sorted list (busiest first). */
+function providerBreakdown(acc: Aggregate): ProviderBreakdown[] {
+  return [...acc.providerStats.entries()]
+    .map(([provider, stat]) => ({
+      provider,
+      requests: stat.requests,
+      successes: stat.successes,
+      errors: stat.errors,
+      local: isLocalProvider(provider),
+      costUsd: stat.costUsd,
+      avgMs: stat.msCount > 0 ? stat.msTotal / stat.msCount : null,
+      inputTokens: stat.inputTokens,
+      outputTokens: stat.outputTokens,
+    }))
+    .sort((a, b) => b.requests - a.requests || a.provider.localeCompare(b.provider));
+}
+
 function aggregateEvent(acc: Aggregate, ev: MetricsEvent): void {
   switch (ev.event) {
     case 'routing_decision': {
       acc.totalRequests += 1;
       if (isCloudProvider(ev.provider)) acc.cloudRequests += 1;
+      aggregateProvider(acc, ev);
       if (ev.target === 'LOCAL' || ev.target === 'LOCAL+CTX') {
         acc.localDispatched += 1;
         // Count as a local completion only when the local provider actually
@@ -288,6 +383,8 @@ function computeSnapshot(acc: Aggregate): MetricSnapshot {
     captured_notes: acc.capturedNotes,
     capture_rate: ratio(acc.capturedNotes, acc.cloudRequests),
     bloom_lag: Math.max(0, acc.capturedNotes - acc.bloomProcessed),
+    providers: providerBreakdown(acc),
+    total_cost_usd: acc.totalCostUsd,
   };
 }
 
@@ -305,8 +402,22 @@ export function metricsSnapshot(): MetricSnapshot {
   return computeSnapshot(acc);
 }
 
+/** Shape returned by the /metrics endpoint. */
+export interface MetricsTimeSeries {
+  generated_at: string;
+  window_days: number;
+  /** Per-day buckets, oldest first. */
+  days: DailyBucket[];
+  /** Window-wide totals. */
+  summary: MetricSnapshot;
+  /** Window-wide per-provider rollup, busiest first. */
+  providers: ProviderBreakdown[];
+  /** Window-wide estimated spend in USD. */
+  total_cost_usd: number;
+}
+
 /** Return per-day time-series for the last 7 days. */
-export function metricsTimeSeries(): { generated_at: string; window_days: number; days: DailyBucket[] } {
+export function metricsTimeSeries(): MetricsTimeSeries {
   const now = new Date();
   const cutoff = new Date(now.getTime() - WINDOW_DAYS * MS_PER_DAY);
   const events = readWindowEvents(cutoff);
@@ -348,14 +459,30 @@ export function metricsTimeSeries(): { generated_at: string; window_days: number
       captures_attempted: acc.capturesAttempted,
       bloom_lag: Math.max(0, acc.capturedNotes - acc.bloomProcessed),
       bloom_processed: acc.bloomProcessed,
+      providers: providerBreakdown(acc),
+      total_cost_usd: acc.totalCostUsd,
     });
   }
+
+  const all = aggregateAll(events);
 
   return {
     generated_at: now.toISOString(),
     window_days: WINDOW_DAYS,
     days,
+    // Window-wide rollup so a dashboard can read totals and the per-provider
+    // breakdown without having to sum the daily buckets itself.
+    summary: computeSnapshot(all),
+    providers: providerBreakdown(all),
+    total_cost_usd: all.totalCostUsd,
   };
+}
+
+/** Fold a flat list of events into one Aggregate. */
+function aggregateAll(events: MetricsEvent[]): Aggregate {
+  const acc = emptyAggregate();
+  for (const ev of events) aggregateEvent(acc, ev);
+  return acc;
 }
 
 // ---------------------------------------------------------------------------
@@ -372,6 +499,7 @@ export function recordRoutingDecision(
   skillName?: string,
   conductor?: boolean,
   conductorDomain?: string,
+  telemetry?: RoutingDecisionTelemetry,
 ): void {
   recordMetrics({
     ts: new Date().toISOString(),
@@ -385,7 +513,16 @@ export function recordRoutingDecision(
     skillName,
     conductor,
     conductorDomain,
+    ...(telemetry ?? {}),
   });
+}
+
+/** Optional per-dispatch telemetry recorded alongside a routing decision. */
+export interface RoutingDecisionTelemetry {
+  ms?: number;
+  costUsd?: number;
+  inputTokens?: number;
+  outputTokens?: number;
 }
 
 export function recordCapture(
