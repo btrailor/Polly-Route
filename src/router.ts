@@ -1,6 +1,6 @@
 import http from 'http';
 import { RequestBody, Complexity, VaultSignal, SkillSignal, ConductorSignal, RoutingTarget, RoutingPlan, ChainEntry } from './types.js';
-import { Config, ProviderConfig } from './config.js';
+import { Config, ProviderConfig, providerIsConfigured } from './config.js';
 import { OllamaAdapter } from './providers/ollama.js';
 import { groqAdapter, cerebrasAdapter, deepseekAdapter, openrouterFreeAdapter, googleAdapter, mistralAdapter, openrouterAdapter, ollamaProAdapter } from './providers/cloud.js';
 import { kimiAdapter } from './providers/kimi.js';
@@ -62,11 +62,13 @@ function pickLocalModel(
   dispatchBody: RequestBody
 ): ReturnType<OllamaAdapter['pickModel']> {
   const chars = estimateChars(dispatchBody.messages);
-  // Add headroom so the model isn't chosen right at its limit.
-  const needed = Math.ceil(chars * 1.2);
-  if (complexity === 'LIGHT') return ollama.pickModel(needed);
-  if (complexity === 'MEDIUM') return ollama.pickModel(needed, 'medium');
-  return ollama.pickModel(needed, 'heavy');
+  // Use the same real budget helper that the size guard uses. Do NOT apply
+  // an extra multiplier here; pickModel already reserves output headroom via
+  // maxCharsForContext. Adding 1.2x here created Defect 2: pickModel selected a
+  // model that the guard then rejected, stranding requests on cloud.
+  if (complexity === 'LIGHT') return ollama.pickModel(chars);
+  if (complexity === 'MEDIUM') return ollama.pickModel(chars, 'medium');
+  return ollama.pickModel(chars, 'heavy');
 }
 
 export async function buildChain(
@@ -80,7 +82,7 @@ export async function buildChain(
   forcedTarget?: RoutingTarget,
   conductor: ConductorSignal = { matched: false },
 ): Promise<RoutingPlan> {
-  const ollama = new OllamaAdapter(config.ollama.models, config.ollama.baseUrl);
+  const ollama = new OllamaAdapter(config.ollama.models, config.ollama.baseUrl, config.ollama);
   const ollamaOk = await ollama.isAvailable();
   const requestChars = estimateChars(body.messages);
 
@@ -227,27 +229,53 @@ export async function buildChain(
 
   const push = (name: string, fn: ChainEntry['fn'] | null, cfg?: ProviderConfig, dispatchBody: RequestBody = cloudBody) => {
     if (!fn) return;
+    if (cfg && !providerIsConfigured(cfg)) {
+      log('skip-no-credentials', { provider: name });
+      return;
+    }
     const sizeChars = estimateChars(dispatchBody.messages);
     if (cfg && !isProviderAvailable(name, cfg.dailyRequestLimit, cfg.maxRequestChars, sizeChars)) return;
     chain.push({ name, fn: () => fn(dispatchBody) });
   };
   const pushOllama = (model: ReturnType<OllamaAdapter['pickModel']>, dispatchBody: RequestBody) => {
-    if (model) chain.push({ name: `ollama/${model.id}`, fn: () => ollama.dispatch(model, dispatchBody) });
+    if (!model) return;
+    const localChars = estimateChars(dispatchBody.messages);
+    if (!ollama.fits(model, localChars)) {
+      log('ollama-skip-size', { provider: `ollama/${model.id}`, requestChars: localChars, maxChars: ollama.maxCharsFor(model.id) });
+      return;
+    }
+    chain.push({ name: `ollama/${model.id}`, fn: () => ollama.dispatch(model, dispatchBody) });
   };
 
   // Build llamacpp adapters for any configured llama-server endpoints.
   // llama-server guarantees n_ctx (unlike Ollama's unknown num_ctx), so we
   // prefer it when available. Each endpoint is a separate local dispatch target.
-  const llamacppAdapters = (config.llamacpp?.endpoints ?? []).map(ep => new LlamacppAdapter(ep));
+  const llamacppAdapters = (config.llamacpp?.endpoints ?? []).map(ep => new LlamacppAdapter(ep, config.llamacpp));
 
   if (target === 'LOCAL' || target === 'LOCAL+CTX') {
     // Primary: local model appropriate to the complexity class.
     // Prefer llamacpp endpoints (guaranteed n_ctx) when available, then Ollama.
+    // Skip endpoints whose guaranteed n_ctx can't fit the request —
+    // avoids guaranteed 400s on every LOCAL dispatch.
+    const localChars = estimateChars(localBody.messages);
     for (const adapter of llamacppAdapters) {
+      const endpoint = config.llamacpp?.endpoints?.find(ep => ep.model === adapter.modelId);
+      const maxChars = adapter.maxChars();
+      if (maxChars > 0 && localChars > maxChars) {
+        log('llamacpp-skip-size', { provider: adapter.name, requestChars: localChars, maxChars, estimatedTokens: Math.ceil(localChars / 2.0) });
+        continue;
+      }
       chain.push({ name: adapter.name, fn: () => adapter.dispatch(localBody) });
     }
     const localModel = pickLocalModel(ollama, complexity, localBody);
-    pushOllama(localModel, localBody);
+    if (localModel) {
+      pushOllama(localModel, localBody);
+    } else if (llamacppAdapters.length === 0 || llamacppAdapters.every(a => {
+      const maxChars = a.maxChars();
+      return maxChars > 0 && localChars > maxChars;
+    })) {
+      log('local-request-exceeds-all-endpoints', { target, requestChars: localChars, ollamaModels: config.ollama.models.map(m => ({ id: m.id, budget: ollama.maxCharsFor(m.id) })) });
+    }
 
     if (forceLocal) {
       // Lockdown / forced-local: no cloud fallback, no copilot, no openrouter.

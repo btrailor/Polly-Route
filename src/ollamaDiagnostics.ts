@@ -46,16 +46,19 @@ function proxyOk(baseUrl: string): { ok: boolean; detail: string } {
   return { ok: true, detail: 'proxy env does not interfere with localhost' };
 }
 
-/** Simple GET probe with timeout. */
-function httpGetJson(url: string, timeoutMs: number): Promise<{ status: number; body: string }> {
+/** Simple GET probe with timeout. Returns the real HTTP status and surfaces errors. */
+function httpGetJson(url: string, timeoutMs: number): Promise<{ status: number; body: string; error?: string }> {
   return new Promise((resolve) => {
     const req = http.get(url, { timeout: timeoutMs }, (res) => {
       let body = '';
       res.on('data', c => body += c);
       res.on('end', () => resolve({ status: res.statusCode ?? 0, body }));
     });
-    req.on('error', () => resolve({ status: 0, body: '' }));
-    req.on('timeout', () => { req.destroy(); resolve({ status: 0, body: '' }); });
+    req.on('error', (e: Error) => resolve({ status: 0, body: '', error: e.message }));
+    req.on('timeout', () => {
+      req.destroy();
+      resolve({ status: 0, body: '', error: `timeout after ${timeoutMs}ms` });
+    });
   });
 }
 
@@ -86,10 +89,15 @@ export async function diagnoseOllama(config: Config): Promise<DiagnosticResult> 
 
   // B. Reachability
   const tagsUrl = `${baseUrl}/api/tags`;
-  const tagsRes = await httpGetJson(tagsUrl, 1500);
+  const probeTimeoutMs = config.ollama.probeTimeoutMs ?? 5000;
+  const tagsRes = await httpGetJson(tagsUrl, probeTimeoutMs);
   const reachable = tagsRes.status === 200;
-  details.push(`ollama /api/tags status=${tagsRes.status}`);
+  const detail = tagsRes.error
+    ? `ollama /api/tags status=${tagsRes.status} error=${tagsRes.error}`
+    : `ollama /api/tags status=${tagsRes.status}`;
+  details.push(detail);
   if (!reachable) {
+    log('ollama-diagnostics-failure', { reason: 'unreachable', status: tagsRes.status, error: tagsRes.error });
     return { ok: false, reachable: false, modelsPresent: false, contextAdequate: false, proxyOk: true, details };
   }
 
@@ -115,7 +123,7 @@ export async function diagnoseOllama(config: Config): Promise<DiagnosticResult> 
   for (const model of config.ollama.models) {
     const showUrl = `${baseUrl}/api/show`;
     const showBody = JSON.stringify({ name: model.id });
-    const showRes = await new Promise<{ status: number; body: string }>((resolve) => {
+    const showRes = await new Promise<{ status: number; body: string; error?: string }>((resolve) => {
       const req = http.request(showUrl, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(showBody) },
@@ -125,8 +133,8 @@ export async function diagnoseOllama(config: Config): Promise<DiagnosticResult> 
         res.on('data', c => body += c);
         res.on('end', () => resolve({ status: res.statusCode ?? 0, body }));
       });
-      req.on('error', () => resolve({ status: 0, body: '' }));
-      req.on('timeout', () => { req.destroy(); resolve({ status: 0, body: '' }); });
+      req.on('error', (e: Error) => resolve({ status: 0, body: '', error: e.message }));
+      req.on('timeout', () => { req.destroy(); resolve({ status: 0, body: '', error: `timeout after ${probeTimeoutMs}ms` }); });
       req.write(showBody);
       req.end();
     });

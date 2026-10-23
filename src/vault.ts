@@ -200,10 +200,19 @@ export async function probeVault(messages: Message[], config: Config): Promise<V
       log('vault probe: Knowledge Skill result', { confidence: ksResult.confidence, score: ksResult.score });
       return ksResult;
     }
-    log('vault probe: Knowledge Skill unavailable, falling back to QMD');
+    log('vault probe: Knowledge Skill unavailable');
   }
 
-  // Fall back to QMD
+  // Fall back to QMD — only if it is actually enabled and configured.
+  // A QMD fallback that is not deployed fails every time: it adds latency
+  // and log noise while recovering nothing.
+  if (config.qmd.enabled === false || !config.qmd.baseUrl) {
+    log('vault probe: no fallback available', {
+      reason: config.qmd.enabled === false ? 'qmd disabled' : 'qmd baseUrl empty',
+    });
+    return { confidence: 'ABSENT', score: 0, chunks: [] };
+  }
+
   log('vault probe: trying QMD', { query, timeoutMs: config.qmd.timeoutMs, url: config.qmd.baseUrl });
   return new Promise((resolve) => {
     probeQMD(query, config, resolve);

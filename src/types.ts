@@ -139,6 +139,10 @@ export interface ConfidenceConfig {
   knownApiCalls?: string[];
   /** Known type names that are valid in the target codebase. */
   knownTypes?: string[];
+  /** Directory containing pre-validation hook scripts. If set and exists, the scorer runs hooks against code blocks in the output. */
+  hookScriptsDir?: string;
+  /** Directory containing cached codemap .md files (e.g. ~/.openclaw/codemaps/). If set, the scorer parses export surfaces, type index, and dependency graph sections to augment knownImports/knownTypes/knownApiCalls. */
+  codemapDir?: string;
 }
 
 export interface RoutingDecision {

@@ -16,6 +16,7 @@ jest.mock('../src/reliabilityGuard', () => ({
 jest.mock('../src/providers/ollama', () => {
   const actual = jest.requireActual('../src/providers/ollama') as any;
   return {
+    ...actual,
     OllamaAdapter: class MockOllama extends actual.OllamaAdapter {
       async isAvailable() { return true; }
       async dispatch() { throw new Error('not dispatched in routing tests'); }

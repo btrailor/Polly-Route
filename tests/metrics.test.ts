@@ -9,6 +9,7 @@ import {
   recordBloom,
   metricsSnapshot,
   metricsTimeSeries,
+  metricsCacheState,
 } from '../src/metrics';
 
 describe('metrics JSONL log and computations', () => {
@@ -71,6 +72,34 @@ describe('metrics JSONL log and computations', () => {
     expect(snap.bloom_lag).toBe(1); // 2 captured - 1 bloomed
   });
 
+  test('counts successful llama.cpp completions as local completions', () => {
+    // Regression: local_completed only matched providers prefixed `ollama/`,
+    // so every successful `llamacpp/<model>` completion was discarded. That
+    // understated local_first_success_rate and inflated apparent cloud
+    // dependency even though the local backend had done the work.
+    recordRoutingDecision('MEDIUM', 'DIRECT', 'LOCAL', 'llamacpp/muse-glimmer-30b', 'success');
+    recordRoutingDecision('MEDIUM', 'DIRECT', 'LOCAL', 'llamacpp/muse-glimmer-30b', 'success');
+    recordRoutingDecision('MEDIUM', 'DIRECT', 'LOCAL', 'ollama/qwen2.5:7b', 'success');
+    // A local dispatch that fell through to cloud is dispatched but not completed.
+    recordRoutingDecision('HEAVY', 'ADJACENT', 'LOCAL+CTX', 'ollamapro', 'success');
+
+    const snap = metricsSnapshot();
+    expect(snap.local_dispatched).toBe(4);
+    expect(snap.local_completed).toBe(3); // 2 llamacpp + 1 ollama
+    expect(snap.cloud_requests).toBe(1); // only the ollamapro fallback
+    expect(snap.local_first_success_rate).toBeCloseTo(3 / 4);
+  });
+
+  test('does not count a failed local attempt as a local completion', () => {
+    recordRoutingDecision('LIGHT', 'DIRECT', 'LOCAL', 'ollama/qwen2.5:7b', 'error');
+    recordRoutingDecision('LIGHT', 'DIRECT', 'LOCAL', 'llamacpp/muse-glimmer-30b', 'error');
+
+    const snap = metricsSnapshot();
+    expect(snap.local_dispatched).toBe(2);
+    expect(snap.local_completed).toBe(0);
+    expect(snap.local_first_success_rate).toBe(0);
+  });
+
   test('time-series returns one bucket per day for the last 7 days', () => {
     recordRoutingDecision('LIGHT', 'DIRECT', 'LOCAL', 'ollama/qwen2.5:7b', 'success');
     recordCapture('groq', 'knowledge_gap', 'MEDIUM', true);
@@ -97,5 +126,37 @@ describe('metrics JSONL log and computations', () => {
 
     const snap = metricsSnapshot();
     expect(snap.total_requests).toBe(1);
+  });
+
+  test('caches events and reuses them when the file has not changed', () => {
+    recordRoutingDecision('LIGHT', 'DIRECT', 'LOCAL', 'ollama/qwen2.5:7b', 'success');
+
+    const first = metricsSnapshot();
+    const cacheAfterFirst = metricsCacheState();
+    expect(first.total_requests).toBe(1);
+    expect(cacheAfterFirst.mtimeMs).not.toBeNull();
+
+    const second = metricsSnapshot();
+    const cacheAfterSecond = metricsCacheState();
+    expect(second.total_requests).toBe(1);
+    expect(cacheAfterSecond.mtimeMs).toBe(cacheAfterFirst.mtimeMs);
+    expect(cacheAfterSecond.size).toBe(cacheAfterFirst.size);
+  });
+
+  test('invalidates cache when the metrics file is appended', () => {
+    recordRoutingDecision('LIGHT', 'DIRECT', 'LOCAL', 'ollama/qwen2.5:7b', 'success');
+    metricsSnapshot();
+    const before = metricsCacheState();
+
+    // Small sleep so the mtime is guaranteed to differ on platforms with 1s resolution.
+    const then = Date.now();
+    while (Date.now() - then < 1100) { /* busy wait */ }
+
+    recordRoutingDecision('MEDIUM', 'ABSENT', 'CLOUD', 'groq', 'success');
+    const snap = metricsSnapshot();
+    const after = metricsCacheState();
+
+    expect(snap.total_requests).toBe(2);
+    expect(after.mtimeMs).not.toBe(before.mtimeMs);
   });
 });

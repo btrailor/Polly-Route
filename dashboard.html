@@ -112,6 +112,51 @@
       font-size: 0.875rem;
     }
     .refresh-btn:hover { border-color: var(--accent); }
+    .health-panel {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+      gap: 1rem;
+      margin-bottom: 2rem;
+    }
+    .health-card {
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 0.75rem;
+      padding: 1rem;
+      display: flex;
+      align-items: center;
+      gap: 0.75rem;
+    }
+    .health-dot {
+      width: 12px;
+      height: 12px;
+      border-radius: 50%;
+      flex-shrink: 0;
+      background: var(--muted);
+    }
+    .health-dot.good { background: var(--good); box-shadow: 0 0 8px var(--good); }
+    .health-dot.warn { background: var(--warn); box-shadow: 0 0 8px var(--warn); }
+    .health-dot.bad  { background: var(--bad);  box-shadow: 0 0 8px var(--bad); }
+    .health-info { flex: 1; }
+    .health-label { font-size: 0.75rem; text-transform: uppercase; letter-spacing: 0.05em; color: var(--muted); }
+    .health-value { font-size: 1rem; font-weight: 600; }
+    .signals-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+      gap: 1rem;
+      margin-top: 1rem;
+    }
+    .signal-card {
+      background: rgba(239, 68, 68, 0.08);
+      border: 1px solid var(--bad);
+      border-radius: 0.75rem;
+      padding: 1rem;
+    }
+    .signal-card .label { font-size: 0.75rem; text-transform: uppercase; letter-spacing: 0.05em; color: var(--muted); margin-bottom: 0.25rem; }
+    .signal-card .value { font-size: 1.75rem; font-weight: 700; color: var(--bad); }
+    .signal-card .sub  { font-size: 0.75rem; color: var(--muted); margin-top: 0.25rem; }
+    .signal-card.zero { border-color: var(--border); background: var(--panel); }
+    .signal-card.zero .value { color: var(--muted); }
   </style>
 </head>
 <body>
@@ -127,12 +172,23 @@
   <main>
     <div id="error" class="error" style="display:none"></div>
 
+    <section class="health-panel" id="health">
+      <!-- filled by JS -->
+    </section>
+
     <section class="summary" id="summary">
       <!-- filled by JS -->
     </section>
 
     <section class="grid" id="charts">
       <!-- filled by JS -->
+    </section>
+
+    <section class="card" style="margin-top: 2rem;">
+      <h3>Negative routing signals <span style="color:var(--muted);font-weight:400;font-size:0.875rem;">(last 7 days from log tail)</span></h3>
+      <div id="signals" class="signals-grid">
+        <!-- filled by JS -->
+      </div>
     </section>
 
     <section class="card" style="margin-top: 2rem;">
@@ -162,6 +218,9 @@
 
   <script>
     const METRICS_URL = '/metrics';
+    const STATUS_URL = '/status';
+    const LOG_SIGNALS_URL = '/log-signals';
+    const REFRESH_INTERVAL_MS = 30000;
     const CHART_CONFIG = {
       cloud_dependency_ratio: { label: 'Cloud dependency ratio', color: '#38bdf8', yMax: 1 },
       local_first_success_rate: { label: 'Local-first success rate', color: '#22c55e', yMax: 1 },
@@ -291,16 +350,91 @@
       }
     }
 
+    function updateHealth(statusPayload, logPayload) {
+      const health = document.getElementById('health');
+      health.innerHTML = '';
+
+      const up = statusPayload && statusPayload.status === 'ok';
+      const reliability = statusPayload?.reliability ?? {};
+      const diag = statusPayload?.reliability?.diagnostics ?? {};
+
+      // Overall router state
+      let stateClass = 'bad', stateLabel = 'DOWN';
+      if (up && reliability.active && diag.ok) { stateClass = 'good'; stateLabel = 'HEALTHY'; }
+      else if (up) { stateClass = 'warn'; stateLabel = 'DEGRADED'; }
+
+      const uptimeSec = statusPayload?.uptime ?? 0;
+      const uptimeStr = uptimeSec < 60 ? `${Math.round(uptimeSec)}s`
+        : uptimeSec < 3600 ? `${Math.round(uptimeSec / 60)}m`
+        : `${Math.floor(uptimeSec / 3600)}h ${Math.round((uptimeSec % 3600) / 60)}m`;
+
+      const cards = [
+        { label: 'Router', value: stateLabel, cls: stateClass },
+        { label: 'Uptime', value: uptimeStr, cls: up ? 'good' : 'bad' },
+        { label: 'Reliability', value: `${reliability.enabled ? 'ON' : 'OFF'} / ${reliability.active ? 'ACTIVE' : 'INACTIVE'}`, cls: reliability.active ? 'good' : 'warn' },
+        { label: 'Ollama reachable', value: diag.reachable ? 'YES' : 'NO', cls: diag.reachable ? 'good' : 'bad' },
+        { label: 'Models present', value: diag.modelsPresent ? 'YES' : 'NO', cls: diag.modelsPresent ? 'good' : 'warn' },
+        { label: 'Context adequate', value: diag.contextAdequate ? 'YES' : 'NO', cls: diag.contextAdequate ? 'good' : 'warn' },
+        { label: 'Diagnostics', value: diag.ok ? 'OK' : 'NOT OK', cls: diag.ok ? 'good' : 'bad' },
+      ];
+
+      for (const c of cards) {
+        const el = document.createElement('div');
+        el.className = 'health-card';
+        el.innerHTML = `
+          <div class="health-dot ${c.cls}"></div>
+          <div class="health-info">
+            <div class="health-label">${c.label}</div>
+            <div class="health-value">${c.value}</div>
+          </div>
+        `;
+        health.appendChild(el);
+      }
+    }
+
+    function updateSignals(payload) {
+      const container = document.getElementById('signals');
+      container.innerHTML = '';
+      if (!payload || !payload.available) {
+        container.innerHTML = '<div class="card" style="grid-column:1/-1"><p>Log-signal data not available.</p></div>';
+        return;
+      }
+      const names = [
+        { key: 'skip-no-credentials', label: 'Skipped provider (no credentials)' },
+        { key: 'ollama-skip-size', label: 'Ollama skipped (size)' },
+        { key: 'local-request-exceeds-all-endpoints', label: 'Request exceeds all local endpoints' },
+        { key: 'confidence-escalation-unavailable', label: 'Confidence escalation unavailable' },
+      ];
+      for (const n of names) {
+        const s = payload.signals[n.key] || { count: 0, last_ts: null };
+        const zeroClass = s.count === 0 ? ' zero' : '';
+        const el = document.createElement('div');
+        el.className = 'signal-card' + zeroClass;
+        el.innerHTML = `
+          <div class="label">${n.label}</div>
+          <div class="value">${fmtNum(s.count)}</div>
+          <div class="sub">${s.last_ts ? 'last ' + new Date(s.last_ts).toLocaleString() : 'no events in tail'}</div>
+        `;
+        container.appendChild(el);
+      }
+    }
+
     async function load() {
       const status = document.getElementById('status');
       const error = document.getElementById('error');
+      const now = new Date();
       status.textContent = 'Loading…';
       error.style.display = 'none';
 
       try {
-        const res = await fetch(METRICS_URL);
-        if (!res.ok) throw new Error(`HTTP ${res.status}`);
-        const payload = await res.json();
+        const [metricsRes, statusRes, signalsRes] = await Promise.all([
+          fetch(METRICS_URL),
+          fetch(STATUS_URL),
+          fetch(LOG_SIGNALS_URL),
+        ]);
+        if (!metricsRes.ok) throw new Error(`metrics HTTP ${metricsRes.status}`);
+
+        const payload = await metricsRes.json();
         const days = payload.days || [];
         const latest = days[days.length - 1] || {};
 
@@ -308,18 +442,34 @@
         updateCharts(days);
         updateTable(days);
 
-        const generated = payload.generated_at ? new Date(payload.generated_at).toLocaleString() : 'now';
-        status.textContent = `Window: ${payload.window_days} days • Generated ${generated}`;
+        let statusPayload = null;
+        if (statusRes.ok) {
+          try { statusPayload = await statusRes.json(); } catch {}
+        }
+        let signalsPayload = null;
+        if (signalsRes.ok) {
+          try { signalsPayload = await signalsRes.json(); } catch {}
+        }
+        updateHealth(statusPayload, signalsPayload);
+        updateSignals(signalsPayload);
+
+        status.textContent = `Updated ${now.toLocaleString()} • Window: ${payload.window_days} days`;
       } catch (e) {
-        error.textContent = `Failed to load metrics: ${e.message}`;
+        error.textContent = `Failed to load dashboard: ${e.message}`;
         error.style.display = 'block';
-        status.textContent = 'Error';
+        status.textContent = `Error at ${now.toLocaleString()}`;
       }
+    }
+
+    function visibilityAwareTick() {
+      if (document.visibilityState === 'hidden') return;
+      load();
     }
 
     document.getElementById('refresh').addEventListener('click', load);
     init();
     load();
+    setInterval(visibilityAwareTick, REFRESH_INTERVAL_MS);
   </script>
 </body>
 </html>

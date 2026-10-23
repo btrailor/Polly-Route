@@ -6,6 +6,12 @@ export interface OllamaModel {
   name: string;
   maxChars: number;
   weight: 'light' | 'medium' | 'heavy';
+  /** Model context window in tokens, used for the real budget calculation. */
+  contextTokens?: number;
+  /** Per-model chars-per-token override. */
+  charsPerToken?: number;
+  /** Per-model output headroom override (tokens). */
+  headroomTokens?: number;
 }
 
 export interface ProviderConfig {
@@ -15,6 +21,24 @@ export interface ProviderConfig {
   dailyRequestLimit?: number;  // max requests per 24h rolling window (free tier enforcement)
   maxRequestChars?: number;    // skip provider if request exceeds this size
   timeoutMs?: number;           // optional per-provider timeout override
+}
+
+/** Estimate of characters consumed per token when checking context fit. */
+export const DEFAULT_CHARS_PER_TOKEN = 2.0;
+
+/** Output token headroom: reserve this fraction of the context window for generation. */
+export const CONTEXT_HEADROOM_TOKENS = 4096;
+
+/** Compute the safe character budget for a local model or endpoint.
+ *  Uses the configured charsPerToken (default 2.0) and reserves headroom for the response.
+ */
+export function maxCharsForContext(
+  contextTokens: number,
+  charsPerToken: number = DEFAULT_CHARS_PER_TOKEN,
+  headroomTokens: number = CONTEXT_HEADROOM_TOKENS,
+): number {
+  const usableTokens = Math.max(0, contextTokens - headroomTokens);
+  return Math.floor(usableTokens * charsPerToken);
 }
 
 export interface SkillCoverageConfig {
@@ -64,6 +88,13 @@ export interface Config {
   ollama: {
     baseUrl: string;
     models: OllamaModel[];
+    timeoutMs?: number;
+    modelTimeouts?: Record<string, number>;
+    probeTimeoutMs?: number;
+    /** Global chars-per-token override for all Ollama models. */
+    charsPerToken?: number;
+    /** Global output headroom override for all Ollama models. */
+    headroomTokens?: number;
   };
   providers: {
     groq?: ProviderConfig;
@@ -84,6 +115,13 @@ export interface Config {
     collection: string;
     timeoutMs: number;
     minScore: number;
+    /**
+     * Whether the QMD fallback probe is enabled. Defaults to true for
+     * backward compatibility. Set false when no QMD daemon is deployed —
+     * the probe then fails every time, adding latency and noise without
+     * recovering any request.
+     */
+    enabled?: boolean;
   };
   knowledgeSkill?: {
     baseUrl: string;
@@ -94,15 +132,32 @@ export interface Config {
   reliability?: ReliabilityConfig;
   confidence?: ConfidenceConfig;
   llamacpp?: {
-    endpoints: { baseUrl: string; model: string; minCtx: number }[];
+    /** Global defaults applied to every endpoint. */
+    charsPerToken?: number;
+    headroomTokens?: number;
+    endpoints: {
+      baseUrl: string;
+      model: string;
+      minCtx: number;
+      timeoutMs?: number;
+      charsPerToken?: number;
+      headroomTokens?: number;
+    }[];
   };
 }
 
 const DEFAULT_OLLAMA_MODELS: OllamaModel[] = [
-  { id: 'qwen2.5:7b',        name: 'Qwen 2.5 7B',         maxChars:  28000, weight: 'light'  },
-  { id: 'qwen2.5-coder:32b', name: 'Qwen 2.5 Coder 32B',  maxChars: 112000, weight: 'medium' },
-  { id: 'qwen2.5:72b',       name: 'Qwen 2.5 72B',        maxChars: 480000, weight: 'heavy'  },
+  { id: 'qwen2.5:7b',        name: 'Qwen 2.5 7B',         maxChars:  28000, weight: 'light',  contextTokens: 32768 },
+  { id: 'qwen2.5-coder:32b', name: 'Qwen 2.5 Coder 32B',  maxChars: 112000, weight: 'medium', contextTokens: 32768 },
+  { id: 'qwen2.5:72b',       name: 'Qwen 2.5 72B',        maxChars: 112000, weight: 'heavy',  contextTokens: 32768 },
 ];
+
+// Provider ids that share a single secret file. The map key is the provider id
+// used in Config['providers']; the value is the secret filename base (without
+// `_api_key` suffix). For example, `openrouter_free` resolves to `openrouter_api_key`.
+const PROVIDER_SECRET_ALIASES: Record<string, string> = {
+  openrouter_free: 'openrouter',
+};
 
 // Map provider ids to the env var that holds their API key fallback.
 // Secrets live in ~/.openclaw/secrets/<provider>_api_key and are injected
@@ -144,7 +199,8 @@ function resolveProviderApiKeys(providers: Config['providers']): Config['provide
   for (const [id, cfg] of Object.entries(providers ?? {})) {
     if (!cfg) continue;
     const envKey = PROVIDER_ENV_KEYS[id];
-    const secretName = `${id}_api_key`;
+    const secretBase = PROVIDER_SECRET_ALIASES[id] ?? id;
+    const secretName = `${secretBase}_api_key`;
     const apiKey =
       cfg.apiKey?.trim()
       || (envKey ? process.env[envKey]?.trim() : undefined)
@@ -152,6 +208,11 @@ function resolveProviderApiKeys(providers: Config['providers']): Config['provide
     resolved[id as keyof Config['providers']] = { ...cfg, apiKey };
   }
   return resolved;
+}
+
+/** True when a provider block exists in config and a non-empty API key resolved. */
+export function providerIsConfigured(cfg?: ProviderConfig): boolean {
+  return !!(cfg && cfg.apiKey && cfg.apiKey.length > 0);
 }
 
 export function loadConfig(): Config {
@@ -170,6 +231,10 @@ export function loadConfig(): Config {
     ollama: {
       baseUrl: raw.ollama?.baseUrl ?? 'http://127.0.0.1:11434',
       models: raw.ollama?.models ?? DEFAULT_OLLAMA_MODELS,
+      timeoutMs: raw.ollama?.timeoutMs,
+      modelTimeouts: raw.ollama?.modelTimeouts,
+      probeTimeoutMs: raw.ollama?.probeTimeoutMs,
+      charsPerToken: raw.ollama?.charsPerToken,
     },
     providers: resolveProviderApiKeys(raw.providers ?? {}),
     qmd: {
@@ -177,6 +242,7 @@ export function loadConfig(): Config {
       collection: raw.qmd?.collection ?? 'vault',
       timeoutMs: raw.qmd?.timeoutMs ?? 500,
       minScore: raw.qmd?.minScore ?? 0.89,
+      enabled: raw.qmd?.enabled ?? true,
     },
     knowledgeSkill: raw.knowledgeSkill ?? {
       baseUrl: 'http://localhost:4201',
@@ -202,6 +268,11 @@ export function loadConfig(): Config {
     })(),
     reliability: raw.reliability,
     confidence: raw.confidence,
-    llamacpp: raw.llamacpp,
+    llamacpp: (() => {
+      if (!raw.llamacpp) return undefined;
+      return {
+        endpoints: raw.llamacpp.endpoints ?? [],
+      };
+    })(),
   };
 }

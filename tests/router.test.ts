@@ -48,6 +48,7 @@ let lastDispatchBody: RequestBody | null = null;
 jest.mock('../src/providers/ollama', () => {
   const actual = jest.requireActual('../src/providers/ollama') as any;
   return {
+    ...actual,
     OllamaAdapter: class MockOllama extends actual.OllamaAdapter {
       async isAvailable() { return true; }
       async dispatch(model: any, body: any) {
@@ -319,5 +320,66 @@ describe('decideTarget with skill coverage', () => {
     expect(decideTarget('LIGHT', makeVault('ABSENT'), fits)).toBe('LOCAL');
     expect(decideTarget('MEDIUM', makeVault('ABSENT'), fits)).toBe('CLOUD');
     expect(decideTarget('HEAVY', makeVault('ABSENT'), fits)).toBe('CLOUD');
+  });
+});
+
+// ─── Phase 0 focused tests ────────────────────────────────────────────────────
+
+describe('Phase 0 fixes — Ollama size guard', () => {
+  const BIG_BODY: RequestBody = {
+    model: 'auto',
+    messages: [{ role: 'user', content: 'x'.repeat(70000) }],
+  };
+
+  test('small request passes size guard and routes to local Ollama', async () => {
+    const { chain } = await buildChain(SMALL_BODY, 'LIGHT', makeVault('ABSENT'), TEST_CONFIG);
+    expect(names(chain)[0]).toBe('ollama');
+  });
+
+  test('oversized request skips local Ollama via ollama-skip-size', async () => {
+    const { chain } = await buildChain(BIG_BODY, 'MEDIUM', makeVault('DIRECT'), TEST_CONFIG);
+    const ns = names(chain);
+    expect(ns).not.toContain('ollama');
+    expect(ns[0]).not.toBe('ollama');
+  });
+
+  test('oversized request still produces cloud fallback chain', async () => {
+    const { chain } = await buildChain(BIG_BODY, 'MEDIUM', makeVault('ABSENT'), TEST_CONFIG);
+    const ns = names(chain);
+    expect(ns).not.toContain('ollama');
+    expect(ns.length).toBeGreaterThan(0);
+    expect(ns).toContain('google');
+    expect(ns).toContain('groq');
+  });
+});
+
+describe('Phase 0 fixes — empty credentials skip', () => {
+  test('cloud provider with empty apiKey is skipped', async () => {
+    const emptyConfig: Config = {
+      ...TEST_CONFIG,
+      providers: {
+        ...TEST_CONFIG.providers,
+        groq: { baseUrl: 'https://api.groq.com/openai/v1', apiKey: '', defaultModel: 'llama-3.3-70b-versatile' },
+      },
+    };
+    const { chain } = await buildChain(SMALL_BODY, 'MEDIUM', makeVault('ABSENT'), emptyConfig);
+    const ns = names(chain);
+    expect(ns).not.toContain('groq');
+    expect(ns).toContain('google');
+  });
+
+  test('all cloud providers with empty keys produce empty cloud chain', async () => {
+    const emptyConfig: Config = {
+      ...TEST_CONFIG,
+      providers: Object.fromEntries(
+        Object.entries(TEST_CONFIG.providers).map(([k, v]) => [k, { ...v, apiKey: '' }])
+      ) as Config['providers'],
+    };
+    const { chain } = await buildChain(SMALL_BODY, 'MEDIUM', makeVault('ABSENT'), emptyConfig);
+    const ns = names(chain);
+    expect(ns).not.toContain('groq');
+    expect(ns).not.toContain('google');
+    expect(ns).not.toContain('cerebras');
+    expect(ns).not.toContain('mistral');
   });
 });

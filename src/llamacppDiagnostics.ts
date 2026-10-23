@@ -14,6 +14,9 @@ export interface LlamacppEndpoint {
   baseUrl: string;   // e.g. http://127.0.0.1:4210
   model: string;     // alias served, e.g. qwen2.5-coder:32b
   minCtx: number;    // minimum acceptable n_ctx for this endpoint's role
+  timeoutMs?: number; // optional per-endpoint dispatch timeout override
+  charsPerToken?: number; // optional per-endpoint chars-per-token ratio
+  headroomTokens?: number; // optional per-endpoint output headroom
 }
 
 export interface LlamacppProbeResult {

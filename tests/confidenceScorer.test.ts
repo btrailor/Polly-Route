@@ -48,13 +48,15 @@ console.log(content);
 
   test('returns a signal with named checks', () => {
     const signal = scoreOutput('hello world');
-    expect(signal.checks).toHaveLength(5);
+    expect(signal.checks).toHaveLength(7);
     expect(signal.checks.map(c => c.name)).toEqual([
       'import-validity',
       'type-consistency',
       'api-call-validity',
       'code-structure',
       'hallucination-markers',
+      'hook-validation',
+      'conductor-gates',
     ]);
   });
 
@@ -291,6 +293,28 @@ console.log(content);
     const signal = scoreResponse('not json at all');
     expect(signal.score).toBe(1.0);
   });
+  test('empty or null assistant content returns explicit no-content check', () => {
+    const rawBody = JSON.stringify({
+      choices: [{ message: { role: 'assistant', content: null } }],
+      usage: { prompt_tokens: 5, completion_tokens: 0 },
+    });
+    const signal = scoreResponse(rawBody);
+    expect(signal.score).toBe(1.0);
+    expect(signal.shouldEscalate).toBe(false);
+    expect(signal.checks).toHaveLength(1);
+    expect(signal.checks[0].name).toBe('no-content');
+    expect(signal.checks[0].passed).toBe(true);
+    expect(signal.checks[0].weight).toBe(0);
+  });
+
+  test('empty string assistant content returns no-content check', () => {
+    const rawBody = JSON.stringify({
+      choices: [{ message: { role: 'assistant', content: '' } }],
+      usage: { prompt_tokens: 5, completion_tokens: 0 },
+    });
+    const signal = scoreResponse(rawBody);
+    expect(signal.checks[0].name).toBe('no-content');
+  });
 });
 
 // ─── Integration: extractAssistantContent ──────────────────────────────────────
@@ -335,12 +359,12 @@ describe('scoreOutput — escalation threshold', () => {
       '```\n' +
       '// your implementation here';
     const signal = scoreOutput(code, {
-      escalationThreshold: 0.45,
+      escalationThreshold: 0.6,
       knownImports: ['fs', 'path'],
       knownTypes: ['string', 'number'],
       knownApiCalls: ['fs.readFileSync', 'fs.readFile', 'console.log', 'JSON.parse', 'JSON.stringify', 'path.join', 'path.resolve', 'path.dirname', 'path.basename', 'process.env', 'process.exit', 'process.cwd', 'Buffer.from', 'Buffer.concat', 'Buffer.alloc', 'fs.writeFile', 'fs.writeFileSync', 'fs.existsSync', 'fs.mkdirSync', 'fs.readdir', 'http.request', 'http.get', 'fetch', 'setTimeout', 'setInterval', 'clearTimeout', 'clearInterval'],
     });
-    expect(signal.score).toBeLessThan(0.45);
+    expect(signal.score).toBeLessThanOrEqual(0.55);
     expect(signal.shouldEscalate).toBe(true);
   });
 
@@ -353,8 +377,8 @@ describe('scoreOutput — escalation threshold', () => {
   test('custom escalation threshold is respected', () => {
     const text = 'I believe this might work. // your implementation here';
     const signal = scoreOutput(text, { escalationThreshold: 0.9 });
-    // Two checks fail (hedging + placeholder) → score = (0.25+0.20+0.20+0.20+0.15 - 0.15 - 0.15) / 1.0 = 0.70
-    // With threshold 0.9, 0.70 < 0.9 → should escalate
+    // Two checks fail (hedging + placeholder) → score = (1.0 - 0.10 - 0.10) / 1.0 = 0.80
+    // With threshold 0.9, 0.80 < 0.9 → should escalate
     expect(signal.shouldEscalate).toBe(true);
   });
 });
@@ -374,5 +398,134 @@ describe('scoreOutput — weight consistency', () => {
     const totalWeight = signal.checks.reduce((sum, c) => sum + c.weight, 0);
     const expected = Math.round((passedWeight / totalWeight) * 100) / 100;
     expect(signal.score).toBe(expected);
+  });
+});
+
+// ─── Conductor gate detection ─────────────────────────────────────────────────
+
+describe('scoreOutput — conductor-gates check', () => {
+  test('conductor-gates check exists', () => {
+    const signal = scoreOutput('Hello world');
+    const check = signal.checks.find(c => c.name === 'conductor-gates');
+    expect(check).toBeDefined();
+  });
+
+  test('passes when no conductor output is detected', () => {
+    const signal = scoreOutput('Hello world, this is a normal response with no code.');
+    const check = signal.checks.find(c => c.name === 'conductor-gates');
+    expect(check!.passed).toBe(true);
+    expect(check!.detail).toBe('no conductor output detected');
+  });
+
+  test('passes when all conductor gates pass and result is completed', () => {
+    const output = 'Here is the result:\n[conductor] gate scene_file_exists: PASS — ok\n[conductor] gate frontmatter_valid: PASS — ok\n[conductor] result: 3 steps, completed';
+    const signal = scoreOutput(output);
+    const check = signal.checks.find(c => c.name === 'conductor-gates');
+    expect(check!.passed).toBe(true);
+    expect(check!.detail).toContain('all gates passed');
+  });
+
+  test('fails when a conductor gate fails', () => {
+    const output = '[conductor] gate word_count_gt_500: FAIL — only 200 words\n[conductor] result: 2 steps, not completed';
+    const signal = scoreOutput(output);
+    const check = signal.checks.find(c => c.name === 'conductor-gates');
+    expect(check!.passed).toBe(false);
+    expect(check!.detail).toContain('gate failure');
+  });
+
+  test('fails when conductor result is not completed', () => {
+    const output = '[conductor] gate scene_file_exists: PASS — ok\n[conductor] result: 5 steps, not completed';
+    const signal = scoreOutput(output);
+    const check = signal.checks.find(c => c.name === 'conductor-gates');
+    expect(check!.passed).toBe(false);
+    expect(check!.detail).toContain('did not complete');
+  });
+
+  test('fails when conductor has an error', () => {
+    const output = '[conductor] model error: connection refused';
+    const signal = scoreOutput(output);
+    const check = signal.checks.find(c => c.name === 'conductor-gates');
+    expect(check!.passed).toBe(false);
+    expect(check!.detail).toContain('conductor error');
+  });
+
+  test('triggers escalation when conductor gates fail', () => {
+    const output = '[conductor] gate word_count_gt_500: FAIL — only 200 words';
+    const signal = scoreOutput(output, { escalationThreshold: 0.9 });
+    expect(signal.shouldEscalate).toBe(true);
+  });
+});
+// ─── Codemap parsing ─────────────────────────────────────────────────────────
+
+describe('scoreOutput — codemap integration', () => {
+  test('codemapDir pointing to non-existent directory does not crash', () => {
+    const signal = scoreOutput('hello world', {
+      codemapDir: '/nonexistent/path/that/does/not/exist',
+    });
+    expect(signal).toBeDefined();
+    expect(signal.score).toBeGreaterThanOrEqual(0);
+  });
+
+  test('codemapDir with no .md files does not crash', () => {
+    const os = require('os');
+    const fs = require('fs');
+    const path = require('path');
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'codemap-test-'));
+    try {
+      const signal = scoreOutput('hello world', { codemapDir: tmpDir });
+      expect(signal).toBeDefined();
+      expect(signal.score).toBeGreaterThanOrEqual(0);
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true });
+    }
+  });
+
+  test('codemapDir with a fake codemap .md file extracts symbols', () => {
+    const os = require('os');
+    const fs = require('fs');
+    const path = require('path');
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'codemap-test-'));
+    try {
+      const fakeCodemap = [
+        '## 3. Export Surfaces (function signatures)',
+        '```',
+        '[src/foo.h] void init_foo(void)',
+        '[src/foo.h] int get_foo_count(void)',
+        '[src/bar.h] const char* bar_name(void)',
+        '```',
+        '',
+        '## 4. Dependency Graph (module-level #includes)',
+        '```',
+        '[src/foo.c] #include <stdio.h>',
+        '[src/foo.c] #include <foo.h>',
+        '[src/bar.c] #include "bar.h"',
+        '```',
+        '',
+        '## 5. Type Index (typedefs from headers)',
+        '```',
+        '[src/foo.h] 10:typedef struct _FooState {',
+        '[src/bar.h] 5:typedef void(*bar_handler_t)(void*);',
+        '```',
+      ].join('\n');
+      fs.writeFileSync(path.join(tmpDir, 'fake-codemap.md'), fakeCodemap);
+
+      const signal = scoreOutput('hello world', { codemapDir: tmpDir });
+      expect(signal).toBeDefined();
+      expect(signal.checks.length).toBeGreaterThan(0);
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true });
+    }
+  });
+
+  test('codemap symbols augment known lists with real aleph codemap', () => {
+    const os = require('os');
+    const fs = require('fs');
+    const codemapDir = os.homedir() + '/.openclaw/codemaps';
+    if (!fs.existsSync(codemapDir + '/aleph.md')) {
+      return; // skip if no codemap available
+    }
+    const signal = scoreOutput('hello world', { codemapDir });
+    expect(signal).toBeDefined();
+    expect(signal.checks.length).toBeGreaterThan(0);
   });
 });

@@ -2,6 +2,7 @@ import http from 'http';
 import { RequestBody } from '../types.js';
 import { LlamacppEndpoint } from '../llamacppDiagnostics.js';
 import { dispatchOpenAI } from './base.js';
+import { DEFAULT_CHARS_PER_TOKEN, CONTEXT_HEADROOM_TOKENS, maxCharsForContext } from '../config.js';
 
 /**
  * llama-server (llama.cpp) provider adapter.
@@ -15,7 +16,7 @@ import { dispatchOpenAI } from './base.js';
  * handles Ollama responses.
  */
 export class LlamacppAdapter {
-  constructor(private endpoint: LlamacppEndpoint) {}
+  constructor(private endpoint: LlamacppEndpoint, private defaults?: { charsPerToken?: number; headroomTokens?: number }) {}
 
   get modelId(): string {
     return this.endpoint.model;
@@ -30,6 +31,15 @@ export class LlamacppAdapter {
     return `llamacpp/${this.endpoint.model}`;
   }
 
+  /** Safe character budget for this endpoint, using the shared chars/token estimate. */
+  maxChars(): number {
+    return maxCharsForContext(
+      this.endpoint.minCtx,
+      this.endpoint.charsPerToken ?? this.defaults?.charsPerToken ?? DEFAULT_CHARS_PER_TOKEN,
+      this.endpoint.headroomTokens ?? this.defaults?.headroomTokens ?? CONTEXT_HEADROOM_TOKENS,
+    );
+  }
+
   async dispatch(body: RequestBody): Promise<http.IncomingMessage> {
     // Always request non-streaming so server.ts can buffer,
     // rewrite text-format tool calls, and re-emit as SSE if needed.
@@ -39,7 +49,7 @@ export class LlamacppAdapter {
       'llamacpp', // no API key needed for local llama-server
       this.endpoint.model,
       nonStreamBody,
-      { timeoutMs: 600000 }
+      { timeoutMs: this.endpoint.timeoutMs ?? 120_000 }
     );
   }
 

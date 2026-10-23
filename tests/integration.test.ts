@@ -108,6 +108,25 @@ async function waitForFile(filePath: string, timeoutMs = 5000): Promise<void> {
   throw new Error(`Timed out waiting for ${filePath}`);
 }
 
+async function waitForMetricEvent(filePath: string, event: string, timeoutMs = 5000): Promise<any> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (fs.existsSync(filePath) && fs.statSync(filePath).size > 0) {
+      try {
+        const lines = fs.readFileSync(filePath, 'utf-8').trim().split('\n').filter(Boolean);
+        for (let i = lines.length - 1; i >= 0; i--) {
+          const parsed = JSON.parse(lines[i]);
+          if (parsed.event === event) return parsed;
+        }
+      } catch {
+        // File may be mid-write; retry.
+      }
+    }
+    await new Promise(r => setTimeout(r, 50));
+  }
+  throw new Error(`Timed out waiting for event '${event}' in ${filePath}`);
+}
+
 async function waitForCaptureNote(vaultRoot: string, timeoutMs = 5000): Promise<{ name: string; content: string }> {
   const capturedDir = path.join(vaultRoot, '20-Active', 'captured');
   const deadline = Date.now() + timeoutMs;
@@ -376,7 +395,7 @@ describe('frontier gate integration', () => {
     expect(note.content).toContain('vault_gap: knowledge_gap');
     expect(note.content).toContain(MEDIUM_QUERY);
 
-    await waitForFile(metricsPath);
+    await waitForMetricEvent(metricsPath, 'capture');
     const metrics = readMetrics();
     const routing = metrics.filter((m: any) => m.event === 'routing_decision');
     expect(routing.length).toBe(1);
@@ -473,7 +492,7 @@ describe('frontier gate integration', () => {
     const note = await waitForCaptureNote(vaultRoot);
     expect(note.content).toContain('vault_gap: capability_gap');
 
-    await waitForFile(metricsPath);
+    await waitForMetricEvent(metricsPath, 'capture');
     const metrics = readMetrics();
     const routing = metrics.filter((m: any) => m.event === 'routing_decision');
     expect(routing.length).toBe(1);

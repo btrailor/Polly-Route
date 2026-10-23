@@ -16,6 +16,8 @@ import { recordReliability, gcReliability, recordLocalSuccess } from './reliabil
 import { classifyForReliability, getReliabilityDiagnostics, reliabilityGuardActive } from './reliabilityGuard.js';
 import { RequestBody, RoutingTarget, ConfidenceSignal, ConductorSignal } from './types.js';
 import { scoreResponse } from './confidenceScorer.js';
+import { maxCharsForContext } from './config.js';
+import { scanLogSignals } from './logSignals.js';
 import { contractTranslate, DEFAULT_LOCAL_SURFACE } from './contractTranslation.js';
 import { loadModesConfig } from './modes/loader.js';
 import { resolveMode, RequestMetadata } from './modes/resolver.js';
@@ -296,12 +298,6 @@ async function handleCompletions(req: http.IncomingMessage, res: http.ServerResp
     });
   };
 
-  // Token budgets by model (chars not tokens, ~4 chars/token)
-  const LOCAL_BUDGETS: Record<string, number> = {
-    'qwen2.5:7b':        8000 * 4,
-    'qwen2.5-coder:32b': 32000 * 4,
-  };
-
   for (const entry of chain) {
     try {
       // Contract translation for local model dispatch (design.md I1–I7)
@@ -319,7 +315,16 @@ async function handleCompletions(req: http.IncomingMessage, res: http.ServerResp
 
       if (isLocal && body.tools?.length) {
         const modelId = entry.name.replace('ollama/', '');
-        const maxChars = LOCAL_BUDGETS[modelId] ?? 8000 * 4;
+        // Use the same shared budget helper as the router guard. Ollama models
+        // default to 32K context (except unknown, which falls back to 8K). This
+        // keeps server.ts aligned with router.ts so a request rejected upstream
+        // cannot accidentally pass here.
+        const contextTokens = {
+          'qwen2.5:7b': 32768,
+          'qwen2.5-coder:32b': 32768,
+          'qwen2.5:72b': 32768,
+        }[modelId] ?? 8192;
+        const maxChars = maxCharsForContext(contextTokens);
         // Agent-aware contract translation: if the agent's tool profile includes exec,
         // preserve it in the local surface so filesystem-exploration agents can work.
         const toolNames = body.tools.map((t: any) => t.function?.name).filter(Boolean);
@@ -460,6 +465,13 @@ async function handleCompletions(req: http.IncomingMessage, res: http.ServerResp
               shouldEscalate: signal.shouldEscalate,
               checks: signal.checks.map(c => ({ name: c.name, passed: c.passed })),
             });
+            if (signal.shouldEscalate) {
+              log('confidence-escalation-unavailable', {
+                provider: entry.name,
+                score: signal.score,
+                detail: signal.checks.filter(c => !c.passed).map(c => c.name).join(','),
+              });
+            }
           }
 
           const cost = estimateCost(entry.name, usage);
@@ -668,6 +680,10 @@ function handleStatus(_req: http.IncomingMessage, res: http.ServerResponse) {
   });
 }
 
+function handleLogSignals(_req: http.IncomingMessage, res: http.ServerResponse) {
+  sendJson(res, 200, scanLogSignals());
+}
+
 function handleMetrics(_req: http.IncomingMessage, res: http.ServerResponse) {
   sendJson(res, 200, metricsTimeSeries());
 }
@@ -701,6 +717,7 @@ const server = http.createServer(async (req, res) => {
   if (req.method === 'GET'  && url === '/v1/models')           return handleModels(req, res);
   if (req.method === 'GET'  && (url === '/status' || url === '/health')) return handleStatus(req, res);
   if (req.method === 'GET'  && url === '/metrics')           return handleMetrics(req, res);
+  if (req.method === 'GET'  && url === '/log-signals')     return handleLogSignals(req, res);
   if (req.method === 'GET'  && url === '/dashboard')         return handleDashboard(req, res);
   if (req.method === 'GET'  && url.startsWith('/log'))         return handleLog(req, res);
   sendJson(res, 404, { error: { message: 'Not found' } });

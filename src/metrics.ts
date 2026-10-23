@@ -138,6 +138,29 @@ export function recordMetrics(event: MetricsEvent): void {
 }
 
 // ---------------------------------------------------------------------------
+// In-memory cache for window events
+// ---------------------------------------------------------------------------
+
+interface MetricsCache {
+  path: string;
+  mtimeMs: number;
+  size: number;
+  events: MetricsEvent[];
+}
+
+let metricsCache: MetricsCache | null = null;
+
+/** Test-only hook to inspect the current cache state. */
+export function metricsCacheState(): { path: string | null; mtimeMs: number | null; size: number | null; hit: boolean } {
+  return {
+    path: metricsCache?.path ?? null,
+    mtimeMs: metricsCache?.mtimeMs ?? null,
+    size: metricsCache?.size ?? null,
+    hit: false,
+  };
+}
+
+// ---------------------------------------------------------------------------
 // Reading / aggregating
 // ---------------------------------------------------------------------------
 
@@ -169,8 +192,12 @@ function emptyAggregate(): Aggregate {
   };
 }
 
+function isLocalProvider(provider: string): boolean {
+  return provider.startsWith('ollama/') || provider.startsWith('llamacpp/');
+}
+
 function isCloudProvider(provider: string): boolean {
-  return !provider.startsWith('ollama/') && !provider.startsWith('llamacpp/');
+  return !isLocalProvider(provider);
 }
 
 function aggregateEvent(acc: Aggregate, ev: MetricsEvent): void {
@@ -181,8 +208,12 @@ function aggregateEvent(acc: Aggregate, ev: MetricsEvent): void {
       if (ev.target === 'LOCAL' || ev.target === 'LOCAL+CTX') {
         acc.localDispatched += 1;
         // Count as a local completion only when the local provider actually
-        // returned the successful response.
-        if (ev.outcome === 'success' && ev.provider.startsWith('ollama/')) {
+        // returned the successful response. Both local backends count:
+        // `ollama/<model>` and `llamacpp/<model>`. Restricting this to
+        // `ollama/` alone silently discarded every successful llama.cpp
+        // completion, understating local_first_success_rate and inflating
+        // the apparent cloud dependency.
+        if (ev.outcome === 'success' && isLocalProvider(ev.provider)) {
           acc.localCompleted += 1;
         }
       }
@@ -205,7 +236,22 @@ function aggregateEvent(acc: Aggregate, ev: MetricsEvent): void {
 
 function readWindowEvents(cutoff: Date): MetricsEvent[] {
   const filePath = getMetricsPath();
-  if (!fs.existsSync(filePath)) return [];
+  if (!fs.existsSync(filePath)) {
+    metricsCache = null;
+    return [];
+  }
+
+  const stat = fs.statSync(filePath);
+  if (
+    metricsCache &&
+    metricsCache.path === filePath &&
+    metricsCache.mtimeMs === stat.mtimeMs &&
+    metricsCache.size === stat.size
+  ) {
+    // The file has not changed since our last parse; reuse cached events.
+    // Filter again by cutoff in case the rolling window advanced.
+    return metricsCache.events.filter(ev => withinWindow(ev.ts, cutoff));
+  }
 
   const events: MetricsEvent[] = [];
   const raw = fs.readFileSync(filePath, 'utf-8');
@@ -220,6 +266,8 @@ function readWindowEvents(cutoff: Date): MetricsEvent[] {
       // Ignore malformed lines; the log is append-only and should recover.
     }
   }
+
+  metricsCache = { path: filePath, mtimeMs: stat.mtimeMs, size: stat.size, events };
   return events;
 }
 
