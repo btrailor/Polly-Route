@@ -506,20 +506,46 @@ async function handleCompletions(req: http.IncomingMessage, res: http.ServerResp
       if (upstream.headers['transfer-encoding'] && !isLocal) headers['transfer-encoding'] = upstream.headers['transfer-encoding'] as string;
 
       if (isLocal) {
-        // Buffer local model response to allow tool-call rewriting and confidence scoring
-        const rawChunks: Buffer[] = [];
-        upstream.on('data', (c: Buffer) => rawChunks.push(c));
-        upstream.on('end', () => {
-          let rawBody = rewriteTextToolCall(Buffer.concat(rawChunks).toString());
+        // Buffer local model response to allow tool-call rewriting and confidence scoring.
+        //
+        // The whole body must be buffered BEFORE the chain can decide anything,
+        // so this branch awaits a promise that resolves with the buffered
+        // result. Previously the buffering lived in an `upstream.on('end')`
+        // callback and the escalation decision was made there, which meant:
+        //
+        //   - `await entry.fn(dispatched)` resolved as soon as the upstream
+        //     response HEADERS arrived, so the `for (const entry of chain)`
+        //     loop was already at the end of its body;
+        //   - the `return` inside the 'end' callback that meant "escalate to
+        //     the next provider" only exited the callback, not the loop;
+        //   - the HTTP response was never written.
+        //
+        // Net effect: a low-confidence local response HUNG THE CLIENT
+        // FOREVER instead of advancing to the next provider.
+        // Measured 2026-10-29 on chain 'story-idea-world-domain': the report
+        // step scored 0.36 (shouldEscalate) and the request never returned.
+        const buffered = await new Promise<{ rawBody: string; usage?: { prompt_tokens?: number; completion_tokens?: number } }>((resolve, reject) => {
+          const rawChunks: Buffer[] = [];
+          upstream.on('data', (c: Buffer) => rawChunks.push(c));
+          upstream.on('end', () => {
+            let rawBody = rewriteTextToolCall(Buffer.concat(rawChunks).toString());
+            let usage: { prompt_tokens?: number; completion_tokens?: number } | undefined;
+            try { const p = JSON.parse(rawBody); usage = p.usage; } catch {}
+            resolve({ rawBody, usage });
+          });
+          upstream.on('error', (e: Error) => reject(e));
+        });
+
+        {
+          const { rawBody, usage } = buffered;
           const ms = Date.now() - startMs;
-          let usage: { prompt_tokens?: number; completion_tokens?: number } | undefined;
-          try { const p = JSON.parse(rawBody); usage = p.usage; } catch {}
 
           // ── Confidence scoring: structural signal for router escalation ──
           // Score the local model's output. If confidence is low and there
           // are more providers in the chain, escalate to the next one
           // instead of returning a potentially-wrong answer.
           const confidenceCfg = (config as any).confidence;
+          let escalateToNext = false;
           if (confidenceCfg?.enabled) {
             const signal = scoreResponse(rawBody, confidenceCfg);
             log('confidence-score', {
@@ -548,13 +574,23 @@ async function handleCompletions(req: http.IncomingMessage, res: http.ServerResp
                   failure_class: 'ambiguous',
                 }, config);
               }
-              // Continue to the next provider in the chain
-              return;
+              // Advance to the next provider in the chain. This is now a
+              // `continue` (not a `return` from a callback): the whole body is
+              // buffered and awaited, so the chain loop is still on this
+              // iteration and can move on. The previous `return` exited only
+              // the callback, leaving the client hanging with no response.
+              escalateToNext = true;
             }
 
-            // Add confidence headers to the response
-            headers['X-Polly-Confidence'] = signal.score.toFixed(2);
-            headers['X-Polly-Confidence-Tier'] = signal.tier;
+            if (!escalateToNext) {
+              // Add confidence headers to the response
+              headers['X-Polly-Confidence'] = signal.score.toFixed(2);
+              headers['X-Polly-Confidence-Tier'] = signal.tier;
+            }
+          }
+
+          if (escalateToNext) {
+            continue;
           }
 
           res.writeHead(upstream.statusCode ?? 200, { ...headers, 'content-length': Buffer.byteLength(rawBody).toString() });
@@ -568,9 +604,8 @@ async function handleCompletions(req: http.IncomingMessage, res: http.ServerResp
           });
           recordLocalSuccess({ ts: new Date().toISOString(), persona, task_type: taskType, provider: entry.name }, config);
           triggerCapture(entry.name, rawBody);
-        });
-        upstream.on('error', (e: Error) => { log('stream error', { provider: entry.name, error: e.message }); if (!res.writableEnded) res.end(); });
-        return;
+          return;
+        }
       }
 
       res.writeHead(upstream.statusCode ?? 200, headers);
