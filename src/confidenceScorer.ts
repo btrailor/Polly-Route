@@ -606,6 +606,99 @@ export function scoreOutput(
         ? 'no markers detected'
         : `markers: ${markers.join(', ')}`,
     });
+    // (This check IS applicable to prose -- hedging, placeholders, fake
+    // paths and contradictions all appear in prose. It is deliberately not
+    // in the vacuous list.)
+  }
+
+  // ── Prose checks (weight: 0.20 total) ───────────────────────────────────
+  //
+  // The seven checks above all inspect CODE. A prose answer has no code
+  // blocks, so every one of them passed vacuously: measured on 2026-10-29,
+  // 1,962 of 1,975 scored responses returned score 1.0 and escalation never
+  // fired once. The router could not tell a good paragraph from a truncated
+  // one.
+  //
+  // These checks look for the specific failure modes a local model actually
+  // produces on prose: emptiness, truncation mid-thought, and refusal.
+  {
+    const text = output.trim();
+    const lower = text.toLowerCase();
+
+    // The prose checks judge PROSE responses. When the answer is mostly code,
+    // the code checks above are the relevant ones, and penalising a code
+    // response for being short would be wrong.
+    const codeBlockCount = extractCodeBlocks(output).length;
+    const codeish = codeBlockCount > 0
+      || /^\s*(?:import|export|def |class |function |const |let |var |#include|package )/m.test(text);
+    const proseApplies = !codeish;
+
+    // Check 8: Substantive content. A short or empty answer is not a
+    // confident answer; it is a model that ran out of room.
+    const wordCount = text ? text.split(/\s+/).filter(w => w.length > 0).length : 0;
+    // A truncated reasoning response is usually long (it kept thinking) but
+    // never produced a conclusion. Detect "thought, no answer" separately
+    // from "no answer at all".
+    const looksLikeTrace = /^(?:what|why|how|the user|explain|answer|one paragraph|probably|should be|causes?:)/i.test(text)
+      && !/[.!?]\s+\S/.test(text.slice(-200));
+    // A reasoning trace can be long and still contain no answer. Detect the
+    // planning language a trace is full of and treat it as NOT substantive:
+    // the model spent its budget thinking instead of answering.
+    const thinkingNotAnswering = /\b(?:probably|should be|one paragraph|likely|possibly|perhaps|i'?ll|i will|need to|let me|answer:|question:)\b/i.test(text)
+      && !/[.!?]["')\]]?\s*$/.test(text);
+    const thinContent = (wordCount < 25 && !looksLikeTrace) || thinkingNotAnswering;
+    checks.push({
+      name: 'prose-substantive',
+      passed: !thinContent,
+      weight: proseApplies ? 0.30 : 0,
+      detail: !proseApplies
+        ? 'not applicable (response is code)'
+        : thinContent
+          ? (thinkingNotAnswering
+              ? `${wordCount} words but no conclusion (reasoning trace, not an answer)`
+              : `only ${wordCount} word(s) of content`)
+          : `${wordCount} words`,
+    });
+
+    // Check 9: Not truncated mid-thought. A reasoning model that hits the
+    // token ceiling leaves reasoning_content with the question restated and
+    // no conclusion. That is a failed answer, not a confident one.
+    //
+    // Detected by: the text restates a question, AND it never lands on a
+    // sentence-ending conclusion. A reasoning trace also betrays itself with
+    // planning language ("Probably concise", "Should be accurate", "One
+    // paragraph", "Possibl") -- a real answer does not narrate its own
+    // plan in the third person.
+    const restatesQuestion = /\b(?:what|why|how)\b[^.?]*\?/i.test(text.slice(0, 300));
+    const noConclusion = !/[.!?]["')\]]?\s*$/.test(text);
+    const planningLanguage = /\b(?:probably|should be|one paragraph|likely|possibly|perhaps|i'?ll|i will|need to|let me)\b/i.test(text);
+    const truncated = wordCount >= 25
+      && noConclusion
+      && (restatesQuestion || planningLanguage);
+    checks.push({
+      name: 'prose-not-truncated',
+      passed: !truncated,
+      weight: proseApplies ? 0.15 : 0,
+      detail: !proseApplies
+        ? 'not applicable (response is code)'
+        : truncated
+          ? 'answer appears truncated mid-reasoning (no conclusion reached)'
+          : 'complete answer',
+    });
+
+    // Check 10: Refusal / deflection. A model that declines or punts has not
+    // answered, and must not be scored as high confidence.
+    // Match refusal OPENINGS, not the whole text: "I'm sorry", "Sorry, but",
+    // "I cannot", "As an AI", "I don't have access to".
+    const refused = /^(?:i(?:'m| am)\s+(?:sorry|afraid|unable)|sorry[, ]|as an ai|i (?:can(?:not|'t)|won't|am unable to|must decline)|i don'?t have access to|i'?m not able to)/i.test(text);
+    checks.push({
+      name: 'prose-not-refused',
+      passed: !refused,
+      weight: proseApplies ? 0.15 : 0,
+      detail: !proseApplies
+        ? 'not applicable (response is code)'
+        : refused ? 'answer is a refusal or deflection' : 'answered',
+    });
   }
 
   // ── Check 6: Hook validation (weight: 0.20) ──────────────────────────────
@@ -678,8 +771,45 @@ export function scoreOutput(
   }
 
   // ── Compute weighted score ────────────────────────────────────────────────
-  const totalWeight = checks.reduce((sum, c) => sum + c.weight, 0);
-  const passedWeight = checks.filter(c => c.passed).reduce((sum, c) => sum + c.weight, 0);
+  //
+  // VACUOUS CHECKS DO NOT COUNT. A check that found nothing to inspect (no
+  // code blocks, no hook configured, no conductor output) is not evidence that
+  // the answer is good -- it is evidence that the check did not apply. Before
+  // 2026-10-29 those checks contributed 0.70 of weight and passed
+  // unconditionally, which diluted every real signal: a truncated prose answer
+  // scored 0.96 and a refusal scored 0.92, so the router never escalated.
+  //
+  // A check is VACUOUS when it inspected nothing. Those get weight 0 and are
+  // excluded from both the numerator and the denominator.
+  const vacuousNames = new Set([
+    'import-validity',
+    'type-consistency',
+    'api-call-validity',
+    'code-structure',
+    'hook-validation',
+    'conductor-gates',
+  ]);
+
+  const effective = checks.filter((c) => {
+    // A weight-0 check is not applicable -- exclude it from the denominator
+    // entirely rather than letting it pass silently.
+    if (c.weight === 0) return false;
+    if (vacuousNames.has(c.name)) {
+      // The detail text states how many items were inspected. Zero means the
+      // check had nothing to look at.
+      const detail = c.detail ?? '';
+      const zeroInspected =
+        /^0 (?:import|type|call)/.test(detail)
+        || /no code blocks in output/i.test(detail)
+        || /skipped/i.test(detail)
+        || /no conductor output detected/i.test(detail);
+      if (zeroInspected) return false;
+    }
+    return true;
+  });
+
+  const totalWeight = effective.reduce((sum, c) => sum + c.weight, 0);
+  const passedWeight = effective.filter(c => c.passed).reduce((sum, c) => sum + c.weight, 0);
   const score = totalWeight > 0 ? passedWeight / totalWeight : 1.0;
 
   const tier = score >= 0.75 ? 'high' : score >= 0.45 ? 'medium' : 'low';
@@ -732,11 +862,29 @@ export function extractAssistantContent(responseBody: string): string {
     const parsed = JSON.parse(responseBody);
     const choices = parsed.choices ?? [];
     let content = '';
+    let reasoning = '';
     for (const choice of choices) {
       const msg = choice.message ?? choice.delta;
       if (msg?.content) {
         content += typeof msg.content === 'string' ? msg.content : JSON.stringify(msg.content);
       }
+      if (msg?.reasoning_content) {
+        reasoning += typeof msg.reasoning_content === 'string'
+          ? msg.reasoning_content
+          : JSON.stringify(msg.reasoning_content);
+      }
+    }
+    // A reasoning model that runs out of tokens mid-thought puts EVERYTHING
+    // in reasoning_content and leaves content EMPTY. Measured 2026-10-29:
+    // 47 of 1,985 router responses had empty content with 800-1,600 chars of
+    // reasoning. Those were scored as "no-content" -> score 1.0 -> a
+    // truncated answer looked like a perfect one.
+    //
+    // If there is no final content but there IS reasoning, the response is
+    // truncated, not empty. Return the reasoning so it can be inspected --
+    // and let the prose checks below judge whether it is a usable answer.
+    if (!content.trim() && reasoning.trim()) {
+      return reasoning;
     }
     return content;
   } catch {

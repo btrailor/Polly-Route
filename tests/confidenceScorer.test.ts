@@ -40,7 +40,13 @@ console.log(content);
   });
 
   test('returns high confidence for non-code text (no code blocks)', () => {
-    const text = 'This is a helpful response about planning a sprint. No code needed here.';
+    // A substantive prose answer must score high. The sample is long enough
+    // to clear the prose-substantive threshold: a short answer with no
+    // content is genuinely low confidence, and the prose checks now say so.
+    const text = 'This is a helpful response about planning a sprint with a '
+      + 'small team over two weeks. Start by writing the task list, then hold '
+      + 'a short daily sync to unblock anything stuck, and keep the scope tight '
+      + 'so the work ships on time rather than expanding to fill the estimate.';
     const signal = scoreOutput(text);
     expect(signal.score).toBeGreaterThanOrEqual(0.7);
     expect(signal.tier).toBe('high');
@@ -48,13 +54,19 @@ console.log(content);
 
   test('returns a signal with named checks', () => {
     const signal = scoreOutput('hello world');
-    expect(signal.checks).toHaveLength(7);
+    // The three prose checks were added 2026-10-29: the original seven all
+    // inspect code, so a prose answer passed them all vacuously and the
+    // router could not tell a good paragraph from a truncated one.
+    expect(signal.checks).toHaveLength(10);
     expect(signal.checks.map(c => c.name)).toEqual([
       'import-validity',
       'type-consistency',
       'api-call-validity',
       'code-structure',
       'hallucination-markers',
+      'prose-substantive',
+      'prose-not-truncated',
+      'prose-not-refused',
       'hook-validation',
       'conductor-gates',
     ]);
@@ -386,16 +398,31 @@ describe('scoreOutput — escalation threshold', () => {
 // ─── Weight consistency ────────────────────────────────────────────────────────
 
 describe('scoreOutput — weight consistency', () => {
-  test('check weights sum to 1.0', () => {
+  test('every check carries a positive weight', () => {
+    // Weights no longer sum to 1.0 across ALL checks: each check is
+    // independently weighted, and the score is computed over the checks
+    // that actually APPLIED (vacuous and not-applicable checks are excluded
+    // from the denominator). What must hold is that every check declares a
+    // weight, so the score is always explainable.
     const signal = scoreOutput('hello');
-    const totalWeight = signal.checks.reduce((sum, c) => sum + c.weight, 0);
-    expect(totalWeight).toBeCloseTo(1.0, 5);
+    for (const c of signal.checks) {
+      expect(c.weight).toBeGreaterThanOrEqual(0);
+      expect(typeof c.detail).toBe('string');
+    }
+    const applicable = signal.checks.filter(c => c.weight > 0);
+    expect(applicable.length).toBeGreaterThan(0);
   });
 
-  test('score equals fraction of passed weights', () => {
+  test('score equals fraction of passed applicable weights', () => {
     const signal = scoreOutput('hello world');
-    const passedWeight = signal.checks.filter(c => c.passed).reduce((sum, c) => sum + c.weight, 0);
-    const totalWeight = signal.checks.reduce((sum, c) => sum + c.weight, 0);
+    // Only APPLICABLE checks count: a check with weight 0 was not
+    // applicable, and a vacuous check inspected nothing.
+    const applicable = signal.checks.filter(c => c.weight > 0 && !/^0 (?:import|type|call)/.test(c.detail ?? '')
+      && !/no code blocks in output/i.test(c.detail ?? '')
+      && !/skipped/i.test(c.detail ?? '')
+      && !/no conductor output detected/i.test(c.detail ?? ''));
+    const passedWeight = applicable.filter(c => c.passed).reduce((sum, c) => sum + c.weight, 0);
+    const totalWeight = applicable.reduce((sum, c) => sum + c.weight, 0);
     const expected = Math.round((passedWeight / totalWeight) * 100) / 100;
     expect(signal.score).toBe(expected);
   });

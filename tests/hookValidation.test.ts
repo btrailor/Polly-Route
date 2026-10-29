@@ -106,12 +106,22 @@ describe('scoreOutput — hook validation', () => {
     expect(signal.shouldEscalate).toBe(true);
   });
 
-  test('all 6 check weights sum to 1.0', () => {
+  test('hook validation is weighted and the check set is complete', () => {
     const signal = scoreOutput('```lua\nprint("hi")\n```', {
       hookScriptsDir: HOOKS_DIR,
     });
-    const totalWeight = signal.checks.reduce((sum, c) => sum + c.weight, 0);
-    expect(totalWeight).toBeCloseTo(1.0, 5);
-    expect(signal.checks).toHaveLength(7);
+    // Weights no longer sum to 1.0 across all checks: each check is
+    // independently weighted and the score uses only the checks that
+    // APPLIED. For a code response the three prose checks are not
+    // applicable (weight 0) and are excluded from the denominator.
+    const hookCheck = signal.checks.find(c => c.name === 'hook-validation');
+    expect(hookCheck).toBeDefined();
+    expect(hookCheck!.weight).toBeGreaterThan(0);
+
+    // 7 original checks + 3 prose checks added 2026-10-29.
+    expect(signal.checks).toHaveLength(10);
+
+    const applicable = signal.checks.filter(c => c.weight > 0);
+    expect(applicable.length).toBeGreaterThan(0);
   });
 });
