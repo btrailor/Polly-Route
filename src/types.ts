@@ -122,6 +122,18 @@ export type RoutingTarget = 'LOCAL' | 'LOCAL+CTX' | 'CLOUD';
 export interface ChainEntry {
   name: string;
   fn: (body: RequestBody) => Promise<http.IncomingMessage>;
+  /**
+   * The body this entry intends to dispatch, before any server-side contract
+   * translation.
+   *
+   * The server needs this because the router's body carries the injected
+   * vault/skill/conductor context, while the server's own `body` does not.
+   * Translating the server's copy would drop that context; translating the
+   * router's copy keeps it. Before this field existed, the server translated
+   * its own body and the chain entry discarded the result -- so contract
+   * translation never reached the local model.
+   */
+  requestBody?: RequestBody;
 }
 
 export interface RoutingPlan {

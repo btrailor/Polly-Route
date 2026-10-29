@@ -330,51 +330,36 @@ async function handleCompletions(req: http.IncomingMessage, res: http.ServerResp
         log('cerebras-tool-strip', { removedCount: body.tools.length });
       }
 
-      if (isLocal && body.tools?.length) {
-        const modelId = entry.name.replace('ollama/', '');
-        // Use the same shared budget helper as the router guard. Ollama models
-        // default to 32K context (except unknown, which falls back to 8K). This
-        // keeps server.ts aligned with router.ts so a request rejected upstream
-        // cannot accidentally pass here.
-        const contextTokens = {
-          'qwen2.5:7b': 32768,
-          'qwen2.5-coder:32b': 32768,
-          'qwen2.5:72b': 32768,
-        }[modelId] ?? 8192;
-        const maxChars = maxCharsForContext(contextTokens);
-        // Agent-aware contract translation: if the agent's tool profile includes exec,
-        // preserve it in the local surface so filesystem-exploration agents can work.
-        const toolNames = body.tools.map((t: any) => t.function?.name).filter(Boolean);
-        const agentHasExec = toolNames.includes('exec');
-        log('tools-received', { toolNames, agentHasExec, model: modelId });
-        const localSurface = agentHasExec
-          ? [...DEFAULT_LOCAL_SURFACE, 'exec']
-          : DEFAULT_LOCAL_SURFACE;
-        const translated = contractTranslate(
-          body.messages ?? [],
-          body.tools,
-          { localSurface, maxTokens: Math.floor(maxChars / 4), model: modelId },
-        );
-        log('contract-translation', {
-          provider: entry.name,
-          removedTools: translated.removedTools,
-          compressed: translated.compressed,
-          estimatedTokens: translated.estimatedTokens,
-        });
-        dispatchBody = { ...body, messages: translated.messages, tools: translated.tools };
-      }
-
-      const upstream = await entry.fn(dispatchBody);
+      // Contract translation for local models happens in the ROUTER, inside
+      // the chain entry, because only there do we have BOTH the captured body
+      // (which carries the injected vault/skill/conductor context) and the
+      // target model id.
+      //
+      // It used to happen here, on the server's own `body` -- which lacks the
+      // injected context -- and the result was then DISCARDED, because the
+      // chain entries dispatched their own captured body and ignored this
+      // argument. Measured 2026-10-29: a request with 40 tools sent 2,237
+      // tokens of tool definitions to the local model, where contract
+      // translation would have reduced 40 tools to the ~9 in
+      // DEFAULT_LOCAL_SURFACE.
+      // The body ACTUALLY dispatched is the chain entry's own body (the
+      // router's captured, enriched, contract-translated body). The server's
+      // local `dispatchBody` variable is the server's own copy, which lacks
+      // the injected context -- reporting it made this diagnostic lie.
+      const dispatched = entry.requestBody ?? dispatchBody;
+      const upstream = await entry.fn(dispatched);
 
       // Step 1 diagnostic: log exact body sent to local model
       if (isLocal) {
-  log('local-dispatch-body', {
+        const systemContent =
+          dispatched.messages?.find((m: any) => m.role === 'system')?.content as string ?? '';
+        log('local-dispatch-body', {
           provider: entry.name,
-          systemPromptLength: (dispatchBody.messages?.find((m: any) => m.role === 'system')?.content as string ?? '').length,
-          systemPromptPreview: (dispatchBody.messages?.find((m: any) => m.role === 'system')?.content as string ?? '').slice(0, 200),
-          toolCount: dispatchBody.tools?.length ?? 0,
-          toolNames: (dispatchBody.tools ?? []).map((t: any) => t.function?.name),
-          messageCount: dispatchBody.messages?.length ?? 0,
+          systemPromptLength: systemContent.length,
+          systemPromptPreview: systemContent.slice(0, 200),
+          toolCount: dispatched.tools?.length ?? 0,
+          toolNames: (dispatched.tools ?? []).map((t: any) => t.function?.name),
+          messageCount: dispatched.messages?.length ?? 0,
         });
       }
 

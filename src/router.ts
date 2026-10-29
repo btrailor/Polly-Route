@@ -11,6 +11,8 @@ import { LlamacppAdapter } from './providers/llamacpp.js';
 import { injectVaultContext, estimateChars } from './injector.js';
 import { isProviderAvailable } from './budget.js';
 import { adjustTargetByReliability } from './reliability.js';
+import { contractTranslate, DEFAULT_LOCAL_SURFACE } from './contractTranslation.js';
+import { maxCharsForContext } from './config.js';
 import { reliabilityGuardActive } from './reliabilityGuard.js';
 
 function log(msg: string, meta?: object) {
@@ -135,17 +137,74 @@ function buildLocalOnlyChain(
   for (const adapter of llamacppAdapters) {
     const maxChars = adapter.maxChars();
     if (maxChars > 0 && localChars > maxChars) continue;
-    out.push({ name: adapter.name, fn: () => adapter.dispatch(localBody) });
+    const translatedLlc = translateForLocal(localBody, adapter.modelId);
+    out.push({
+      name: adapter.name,
+      fn: () => adapter.dispatch(translatedLlc),
+      requestBody: translatedLlc,
+    });
   }
 
   const model = ollama.pickModel(localChars);
   if (model) {
     const localChars2 = localChars;
     if (ollama.fits(model, localChars2)) {
-      out.push({ name: `ollama/${model.id}`, fn: () => ollama.dispatch(model, localBody) });
+      const translatedOllama = translateForLocal(localBody, model.id, model.contextTokens);
+      out.push({
+        name: `ollama/${model.id}`,
+        fn: () => ollama.dispatch(model, translatedOllama),
+        requestBody: translatedOllama,
+      });
     }
   }
   return out;
+}
+
+/**
+ * Translate a request for a LOCAL model: reduce the tool surface to what the
+ * local model can actually use, and rewrite the system prompt to match.
+ *
+ * This lives in the ROUTER, not the server, because only the router has BOTH
+ * the captured body (which carries the injected vault chunks, skill procedure
+ * and conductor context) AND the target model id.
+ *
+ * The server used to do this translation on its own body -- which lacks the
+ * injected context -- and the result was then DISCARDED, because the chain
+ * entries dispatch their own captured body and ignore the argument. Measured
+ * 2026-10-29: a request with 40 tools sent 2,237 tokens of tool definitions
+ * to the local model, where translation would have reduced 40 tools to the
+ * ~9 in DEFAULT_LOCAL_SURFACE.
+ */
+function translateForLocal(
+  body: RequestBody,
+  modelId: string,
+  contextTokens?: number,
+): RequestBody {
+  const tokens = contextTokens ?? ({
+    'qwen2.5:7b': 32768,
+    'qwen2.5-coder:32b': 32768,
+    'qwen2.5:72b': 32768,
+  }[modelId] ?? 8192);
+  const maxChars = maxCharsForContext(tokens);
+  // Agent-aware: if the agent's tool profile includes exec, preserve it so
+  // filesystem-exploration agents keep working.
+  const toolNames = (body.tools ?? []).map((t: any) => t.function?.name).filter(Boolean);
+  const agentHasExec = toolNames.includes('exec');
+  const localSurface = agentHasExec
+    ? [...DEFAULT_LOCAL_SURFACE, 'exec']
+    : DEFAULT_LOCAL_SURFACE;
+  const translated = contractTranslate(
+    body.messages ?? [],
+    body.tools ?? [],
+    { localSurface, maxTokens: Math.floor(maxChars / 4), model: modelId },
+  );
+  log('contract-translation', {
+    model: modelId,
+    removedTools: translated.removedTools.length,
+    compressed: translated.compressed,
+    estimatedTokens: translated.estimatedTokens,
+  });
+  return { ...body, messages: translated.messages, tools: translated.tools };
 }
 
 export async function buildChain(
@@ -189,9 +248,25 @@ export async function buildChain(
   const explicitCloud = body.metadata?.tier === 'cloud'
     && body.metadata?.localOnly !== true;
   if (vault.confidence === 'DIRECT') {
-    const fits = ollamaOk && pickLocalModel(ollama, complexity, body) !== null;
+    // Inject the built context on the LOCAL path.
+    //
+    // This branch used `localBody = body` while `cloudBody` used `enriched`,
+    // so the cheap local path -- the one that needs the context most --
+    // received LESS context than the paid one. Measured 2026-10-29: a norns
+    // request built 3,643 chars (pack procedure + vault excerpts + conductor
+    // manifest) and the local model received 58 chars, just the bare user
+    // message. The pack probe fired, built a procedure, and that procedure
+    // was discarded.
+    //
+    // The rule now matches the ADJACENT and ABSENT branches: LIGHT keeps
+    // the bare body (simple task, save the tokens), MEDIUM and above get
+    // the enriched body. Vault confidence decides the TIER; it should not
+    // decide whether the retrieved context is used.
+    const useEnriched = contextChunks.length > 0 && complexity !== 'LIGHT';
+    const dispatchBody = useEnriched ? enriched : body;
+    const fits = ollamaOk && pickLocalModel(ollama, complexity, dispatchBody) !== null;
     target = decideTarget(complexity, vault, fits, skill, explicitCloud);
-    localBody = body;
+    localBody = dispatchBody;
   } else if (vault.confidence === 'ADJACENT') {
     if (complexity === 'LIGHT') {
       const fits = ollamaOk && pickLocalModel(ollama, complexity, body) !== null;
@@ -320,7 +395,9 @@ export async function buildChain(
     }
     const sizeChars = estimateChars(dispatchBody.messages);
     if (cfg && !isProviderAvailable(name, cfg.dailyRequestLimit, cfg.maxRequestChars, sizeChars)) return;
-    chain.push({ name, fn: () => fn(dispatchBody) });
+    // Honor the body the server passes in: it may carry contract-translated
+    // messages and tools. Fall back to the captured body when absent.
+    chain.push({ name, fn: (b?: RequestBody) => fn(b ?? dispatchBody), requestBody: dispatchBody });
   };
   const pushOllama = (model: ReturnType<OllamaAdapter['pickModel']>, dispatchBody: RequestBody) => {
     if (!model) return;
@@ -329,7 +406,14 @@ export async function buildChain(
       log('ollama-skip-size', { provider: `ollama/${model.id}`, requestChars: localChars, maxChars: ollama.maxCharsFor(model.id) });
       return;
     }
-    chain.push({ name: `ollama/${model.id}`, fn: () => ollama.dispatch(model, dispatchBody) });
+    // Translate HERE, where the captured (enriched) body and the model id
+    // both exist. See translateForLocal().
+    const translated = translateForLocal(dispatchBody, model.id, model.contextTokens);
+    chain.push({
+      name: `ollama/${model.id}`,
+      fn: () => ollama.dispatch(model, translated),
+      requestBody: translated,
+    });
   };
 
   // Build llamacpp adapters for any configured llama-server endpoints.
@@ -380,7 +464,12 @@ export async function buildChain(
     if (exactLlamacpp) {
       const adapter = llamacppAdapters.find(a => a.modelId === exactLlamacpp!.model);
       if (adapter) {
-        chain.push({ name: adapter.name, fn: () => adapter.dispatch(localBody) });
+        const translatedLlc = translateForLocal(localBody, adapter.modelId);
+      chain.push({
+        name: adapter.name,
+        fn: () => adapter.dispatch(translatedLlc),
+        requestBody: translatedLlc,
+      });
       }
     } else {
       for (const adapter of llamacppAdapters) {
@@ -392,7 +481,12 @@ export async function buildChain(
           log('llamacpp-skip-size', { provider: adapter.name, requestChars: localChars, maxChars, estimatedTokens: Math.ceil(localChars / 2.0) });
           continue;
         }
-        chain.push({ name: adapter.name, fn: () => adapter.dispatch(localBody) });
+        const translatedLlc = translateForLocal(localBody, adapter.modelId);
+      chain.push({
+        name: adapter.name,
+        fn: () => adapter.dispatch(translatedLlc),
+        requestBody: translatedLlc,
+      });
       }
     }
 
@@ -423,19 +517,19 @@ export async function buildChain(
     } else {
       // Fallback cloud chain in case local fails.
       // Ollama Pro is the primary cloud fallback (preferred cloud tier).
-      push('ollamapro',      ollamapro      ? () => ollamapro(cloudBody)      : null, p.ollamapro, cloudBody);
+      push('ollamapro',      ollamapro      ? (b?: RequestBody) => ollamapro(b ?? cloudBody)      : null, p.ollamapro, cloudBody);
       // Direct API adapters — bypass OpenRouter intermediary
-      push('kimi',           kimi           ? () => kimi(cloudBody)           : null, p.kimi, cloudBody);
-      push('glm',            glm            ? () => glm(cloudBody)            : null, p.glm, cloudBody);
-      push('qwen',           qwen           ? () => qwen(cloudBody)           : null, p.qwen, cloudBody);
+      push('kimi',           kimi           ? (b?: RequestBody) => kimi(b ?? cloudBody)           : null, p.kimi, cloudBody);
+      push('glm',            glm            ? (b?: RequestBody) => glm(b ?? cloudBody)            : null, p.glm, cloudBody);
+      push('qwen',           qwen           ? (b?: RequestBody) => qwen(b ?? cloudBody)           : null, p.qwen, cloudBody);
       // Free cloud tiers as deeper fallback
-      push('google',         google         ? () => google(cloudBody)         : null, p.google, cloudBody);
-      push('groq',           groq           ? () => groq(cloudBody)           : null, p.groq, cloudBody);
-      push('deepseek',       deepseek       ? () => deepseek(cloudBody)       : null, p.deepseek, cloudBody);
-      push('openrouter_free', openrouterFree ? () => openrouterFree(cloudBody) : null, p.openrouter_free, cloudBody);
-      push('mistral',        mistral        ? () => mistral(cloudBody)        : null, p.mistral, cloudBody);
-      push('cerebras',       cerebras       ? () => cerebras(cloudBody)       : null, p.cerebras, cloudBody);
-      chain.push({ name: 'copilot', fn: () => copilot(cloudBody) });
+      push('google',         google         ? (b?: RequestBody) => google(b ?? cloudBody)         : null, p.google, cloudBody);
+      push('groq',           groq           ? (b?: RequestBody) => groq(b ?? cloudBody)           : null, p.groq, cloudBody);
+      push('deepseek',       deepseek       ? (b?: RequestBody) => deepseek(b ?? cloudBody)       : null, p.deepseek, cloudBody);
+      push('openrouter_free', openrouterFree ? (b?: RequestBody) => openrouterFree(b ?? cloudBody) : null, p.openrouter_free, cloudBody);
+      push('mistral',        mistral        ? (b?: RequestBody) => mistral(b ?? cloudBody)        : null, p.mistral, cloudBody);
+      push('cerebras',       cerebras       ? (b?: RequestBody) => cerebras(b ?? cloudBody)       : null, p.cerebras, cloudBody);
+      chain.push({ name: 'copilot', fn: (b?: RequestBody) => copilot(b ?? cloudBody) });
     }
   } else { // CLOUD
     // `localOnly` is a hard constraint ("never leave this machine"). It
@@ -452,23 +546,23 @@ export async function buildChain(
       return { target: 'LOCAL', chain, confidenceEnabled: !!(config as any).confidence?.enabled };
     }
     // Ollama Pro is the primary cloud target (preferred cloud tier).
-    push('ollamapro',      ollamapro      ? () => ollamapro(cloudBody)      : null, p.ollamapro, cloudBody);
+    push('ollamapro',      ollamapro      ? (b?: RequestBody) => ollamapro(b ?? cloudBody)      : null, p.ollamapro, cloudBody);
     // Direct API adapters — bypass OpenRouter intermediary
-    push('kimi',           kimi           ? () => kimi(cloudBody)           : null, p.kimi, cloudBody);
-    push('glm',            glm            ? () => glm(cloudBody)            : null, p.glm, cloudBody);
-    push('qwen',           qwen           ? () => qwen(cloudBody)           : null, p.qwen, cloudBody);
+    push('kimi',           kimi           ? (b?: RequestBody) => kimi(b ?? cloudBody)           : null, p.kimi, cloudBody);
+    push('glm',            glm            ? (b?: RequestBody) => glm(b ?? cloudBody)            : null, p.glm, cloudBody);
+    push('qwen',           qwen           ? (b?: RequestBody) => qwen(b ?? cloudBody)           : null, p.qwen, cloudBody);
     // Free cloud tiers as deeper fallback
-    push('google',         google         ? () => google(cloudBody)         : null, p.google, cloudBody);
-    push('groq',           groq           ? () => groq(cloudBody)           : null, p.groq, cloudBody);
-    push('deepseek',       deepseek       ? () => deepseek(cloudBody)       : null, p.deepseek, cloudBody);
-    push('openrouter_free', openrouterFree ? () => openrouterFree(cloudBody) : null, p.openrouter_free, cloudBody);
-    push('mistral',        mistral        ? () => mistral(cloudBody)        : null, p.mistral, cloudBody);
-    push('cerebras',       cerebras       ? () => cerebras(cloudBody)       : null, p.cerebras, cloudBody);
-    chain.push({ name: 'copilot', fn: () => copilot(cloudBody) });
+    push('google',         google         ? (b?: RequestBody) => google(b ?? cloudBody)         : null, p.google, cloudBody);
+    push('groq',           groq           ? (b?: RequestBody) => groq(b ?? cloudBody)           : null, p.groq, cloudBody);
+    push('deepseek',       deepseek       ? (b?: RequestBody) => deepseek(b ?? cloudBody)       : null, p.deepseek, cloudBody);
+    push('openrouter_free', openrouterFree ? (b?: RequestBody) => openrouterFree(b ?? cloudBody) : null, p.openrouter_free, cloudBody);
+    push('mistral',        mistral        ? (b?: RequestBody) => mistral(b ?? cloudBody)        : null, p.mistral, cloudBody);
+    push('cerebras',       cerebras       ? (b?: RequestBody) => cerebras(b ?? cloudBody)       : null, p.cerebras, cloudBody);
+    chain.push({ name: 'copilot', fn: (b?: RequestBody) => copilot(b ?? cloudBody) });
   }
 
   // Last resort (skipped in forced-local mode)
-  if (!forceLocal && !localOnly && openrouter) chain.push({ name: 'openrouter', fn: () => openrouter(cloudBody) });
+  if (!forceLocal && !localOnly && openrouter) chain.push({ name: 'openrouter', fn: (b?: RequestBody) => openrouter(b ?? cloudBody) });
 
   return {
     target,
