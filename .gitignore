@@ -4,3 +4,6 @@ polly-router.config.json
 *.env
 .DS_Store
 config.json
+
+config.json.bak*
+polly-router.log
