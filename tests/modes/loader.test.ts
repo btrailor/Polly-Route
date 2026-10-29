@@ -20,6 +20,14 @@ describe('loadModesConfig', () => {
   });
 
   it('reports a valid config path', () => {
-    expect(modesConfigPath()).toMatch(/\.openclaw[/\\]modes\.json$/);
+    // The path may be overridden via OPENCLAW_MODES_PATH (tests and CI point
+    // it at tests/fixtures/modes.json). When it is not overridden, it must be
+    // the conventional ~/.openclaw/modes.json.
+    const override = process.env.OPENCLAW_MODES_PATH;
+    if (override && override.trim()) {
+      expect(modesConfigPath()).toBe(override.trim());
+    } else {
+      expect(modesConfigPath()).toMatch(/\.openclaw[/\\]modes\.json$/);
+    }
   });
 });
