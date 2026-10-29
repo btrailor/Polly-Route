@@ -1,6 +1,6 @@
 import http from 'http';
-import { RequestBody, Complexity, VaultSignal, SkillSignal, ConductorSignal, RoutingTarget, RoutingPlan, ChainEntry } from './types.js';
-import { Config, ProviderConfig, providerIsConfigured } from './config.js';
+import { RequestBody, Complexity, VaultSignal, SkillSignal, ConductorSignal, RoutingTarget, RoutingPlan, ChainEntry, ModelTier, RoutingMetadata } from './types.js';
+import { Config, ProviderConfig, providerIsConfigured, OllamaModel } from './config.js';
 import { OllamaAdapter } from './providers/ollama.js';
 import { groqAdapter, cerebrasAdapter, deepseekAdapter, openrouterFreeAdapter, googleAdapter, mistralAdapter, openrouterAdapter, ollamaProAdapter } from './providers/cloud.js';
 import { kimiAdapter } from './providers/kimi.js';
@@ -69,6 +69,38 @@ function pickLocalModel(
   if (complexity === 'LIGHT') return ollama.pickModel(chars);
   if (complexity === 'MEDIUM') return ollama.pickModel(chars, 'medium');
   return ollama.pickModel(chars, 'heavy');
+}
+
+/**
+ * Resolve a requested capability tier to a concrete local weight class.
+ *
+ * The chain-execution contract: a chain step declares `tier`, and the router
+ * honours it instead of guessing from complexity. Returns the minimum weight
+ * class to select within, or null when the tier means "no local model".
+ */
+function tierToWeight(tier: ModelTier): 'light' | 'medium' | 'heavy' | null {
+  if (tier === 'light') return 'light';
+  if (tier === 'medium') return 'medium';
+  if (tier === 'heavy') return 'heavy';
+  return null; // 'none' and 'cloud' select no local weight class
+}
+
+/**
+ * Find an exact model id among the registered Ollama models or the configured
+ * llama.cpp endpoints.
+ *
+ * An unresolvable id must NOT silently resolve to a different model -- a chain
+ * step that asked for a specific model must not be served another one.
+ */
+function resolveExactModel(
+  modelId: string,
+  ollamaModels: OllamaModel[],
+  llamacppEndpoints: { model: string }[],
+): { ollama: OllamaModel | null; llamacpp: { model: string } | null } {
+  return {
+    ollama: ollamaModels.find(m => m.id === modelId) ?? null,
+    llamacpp: llamacppEndpoints.find(e => e.model === modelId) ?? null,
+  };
 }
 
 export async function buildChain(
@@ -252,34 +284,88 @@ export async function buildChain(
   // prefer it when available. Each endpoint is a separate local dispatch target.
   const llamacppAdapters = (config.llamacpp?.endpoints ?? []).map(ep => new LlamacppAdapter(ep, config.llamacpp));
 
-  if (target === 'LOCAL' || target === 'LOCAL+CTX') {
+  // Chain-execution routing hints. `metadata.model` pins an exact model id and
+  // wins over `metadata.tier`. `metadata.localOnly` strips the cloud fallback
+  // chain so a local failure surfaces as an error instead of silently
+  // escalating to a cloud provider.
+  const routingMeta: RoutingMetadata = body.metadata ?? {};
+  const requestedTier = routingMeta.tier;
+  const requestedModel = routingMeta.model;
+  const localOnly = routingMeta.localOnly === true;
+
+  // An explicit tier/model pin also forces the local target, unless the
+  // caller explicitly asked for the cloud tier.
+  const tierForcesLocal = requestedModel !== undefined
+    || (requestedTier !== undefined && requestedTier !== 'cloud');
+
+  if (target === 'LOCAL' || target === 'LOCAL+CTX' || tierForcesLocal) {
     // Primary: local model appropriate to the complexity class.
-    // Prefer llamacpp endpoints (guaranteed n_ctx) when available, then Ollama.
-    // Skip endpoints whose guaranteed n_ctx can't fit the request —
-    // avoids guaranteed 400s on every LOCAL dispatch.
+    // Prefer llamacpp endpoints (guaranteed n_ctx), then Ollama.
+    // Skip endpoints whose guaranteed n_ctx can't fit the request.
     const localChars = estimateChars(localBody.messages);
-    for (const adapter of llamacppAdapters) {
-      const endpoint = config.llamacpp?.endpoints?.find(ep => ep.model === adapter.modelId);
-      const maxChars = adapter.maxChars();
-      if (maxChars > 0 && localChars > maxChars) {
-        log('llamacpp-skip-size', { provider: adapter.name, requestChars: localChars, maxChars, estimatedTokens: Math.ceil(localChars / 2.0) });
-        continue;
+
+    let exactOllama: OllamaModel | null = null;
+    let exactLlamacpp: { model: string } | null = null;
+    if (requestedModel !== undefined) {
+      const resolved = resolveExactModel(requestedModel, config.ollama.models, config.llamacpp?.endpoints ?? []);
+      exactOllama = resolved.ollama;
+      exactLlamacpp = resolved.llamacpp;
+      if (!exactOllama && !exactLlamacpp) {
+        // Fail loudly. Do NOT silently substitute a different model: a chain
+        // step that asked for a specific model must not be served another one.
+        log('exact-model-unresolvable', { requestedModel, chainId: routingMeta.chainId, chainStep: routingMeta.chainStep });
+        chain.push({
+          name: `unresolvable:${requestedModel}`,
+          fn: () => Promise.reject(new Error(`Requested model is unresolvable: ${requestedModel}`)),
+        });
+        return { target: 'LOCAL', chain, confidenceEnabled: !!(config as any).confidence?.enabled };
       }
-      chain.push({ name: adapter.name, fn: () => adapter.dispatch(localBody) });
-    }
-    const localModel = pickLocalModel(ollama, complexity, localBody);
-    if (localModel) {
-      pushOllama(localModel, localBody);
-    } else if (llamacppAdapters.length === 0 || llamacppAdapters.every(a => {
-      const maxChars = a.maxChars();
-      return maxChars > 0 && localChars > maxChars;
-    })) {
-      log('local-request-exceeds-all-endpoints', { target, requestChars: localChars, ollamaModels: config.ollama.models.map(m => ({ id: m.id, budget: ollama.maxCharsFor(m.id) })) });
+      log('exact-model-pinned', { requestedModel, resolvedAs: exactOllama ? `ollama/${exactOllama.id}` : `llamacpp/${exactLlamacpp!.model}` });
     }
 
-    if (forceLocal) {
-      // Lockdown / forced-local: no cloud fallback, no copilot, no openrouter.
-      log('forced-local', { forcedTarget, complexity });
+    if (exactLlamacpp) {
+      const adapter = llamacppAdapters.find(a => a.modelId === exactLlamacpp!.model);
+      if (adapter) {
+        chain.push({ name: adapter.name, fn: () => adapter.dispatch(localBody) });
+      }
+    } else {
+      for (const adapter of llamacppAdapters) {
+        // When an exact model is pinned, other llamacpp endpoints are skipped.
+        if (requestedModel !== undefined) continue;
+        const endpoint = config.llamacpp?.endpoints?.find(ep => ep.model === adapter.modelId);
+        const maxChars = adapter.maxChars();
+        if (maxChars > 0 && localChars > maxChars) {
+          log('llamacpp-skip-size', { provider: adapter.name, requestChars: localChars, maxChars, estimatedTokens: Math.ceil(localChars / 2.0) });
+          continue;
+        }
+        chain.push({ name: adapter.name, fn: () => adapter.dispatch(localBody) });
+      }
+    }
+
+    if (exactOllama) {
+      pushOllama(exactOllama, localBody);
+    } else if (requestedModel === undefined) {
+      // Tier-aware selection: when a tier is requested, select within that
+      // weight class rather than the complexity-derived class.
+      const tierWeight = requestedTier !== undefined ? tierToWeight(requestedTier) : null;
+      const localModel = tierWeight
+        ? ollama.pickModel(localChars, tierWeight)
+        : pickLocalModel(ollama, complexity, localBody);
+      if (localModel) {
+        pushOllama(localModel, localBody);
+      } else if (llamacppAdapters.length === 0 || llamacppAdapters.every(a => {
+        const maxChars = a.maxChars();
+        return maxChars > 0 && localChars > maxChars;
+      })) {
+        log('local-request-exceeds-all-endpoints', { target, requestChars: localChars, ollamaModels: config.ollama.models.map(m => ({ id: m.id, budget: ollama.maxCharsFor(m.id) })) });
+      }
+    }
+
+    if (forceLocal || localOnly) {
+      // Lockdown / forced-local / chain localOnly: no cloud fallback, no
+      // copilot, no openrouter. A local failure surfaces as an error rather
+      // than silently escalating to a cloud provider.
+      log('forced-local', { forcedTarget, complexity, localOnly, chainId: routingMeta.chainId, chainStep: routingMeta.chainStep });
     } else {
       // Fallback cloud chain in case local fails.
       // Ollama Pro is the primary cloud fallback (preferred cloud tier).
@@ -315,7 +401,7 @@ export async function buildChain(
   }
 
   // Last resort (skipped in forced-local mode)
-  if (!forceLocal && openrouter) chain.push({ name: 'openrouter', fn: () => openrouter(cloudBody) });
+  if (!forceLocal && !localOnly && openrouter) chain.push({ name: 'openrouter', fn: () => openrouter(cloudBody) });
 
   return {
     target,

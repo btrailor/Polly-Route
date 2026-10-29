@@ -36,11 +36,46 @@ export interface RequestBody {
   stream?: boolean;
   max_tokens?: number;
   temperature?: number;
+  /** Chain-execution routing hints. Honoured only for local targets. */
+  metadata?: RoutingMetadata;
   [key: string]: unknown;
 }
 
 export type Complexity = 'LIGHT' | 'MEDIUM' | 'HEAVY';
 export type VaultConfidence = 'DIRECT' | 'ADJACENT' | 'ABSENT';
+
+/**
+ * Capability tier requested by a caller that wants a specific model class.
+ *
+ * This is the chain-execution contract (Syntaxis `Chain` tool). A chain step
+ * declares a tier; the chain runner passes it to the router; the router
+ * resolves it to a concrete local model instead of guessing from complexity.
+ *
+ * `none` means the step needs no model at all — a deterministic script step.
+ * `cloud` opts into the cloud fallback chain (never selected implicitly).
+ */
+export type ModelTier = 'light' | 'medium' | 'heavy' | 'none' | 'cloud';
+
+/**
+ * Routing metadata attached to a request by a chain runner or an agent.
+ *
+ * `tier` pins the model class. `model` pins an exact model id and wins over
+ * `tier`. `localOnly` strips the cloud fallback chain entirely, so a
+ * local-tier failure surfaces as an error rather than silently escalating to
+ * a cloud provider.
+ */
+export interface RoutingMetadata {
+  /** Requested model class. */
+  tier?: ModelTier;
+  /** Exact model id (e.g. "qwen2.5:7b"). Overrides `tier`. */
+  model?: string;
+  /** When true, never fall through to a cloud provider. */
+  localOnly?: boolean;
+  /** Chain identifier, for request-log attribution. */
+  chainId?: string;
+  /** Step identifier within the chain, for request-log attribution. */
+  chainStep?: string;
+}
 
 export interface VaultSignal {
   confidence: VaultConfidence;

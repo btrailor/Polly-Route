@@ -239,9 +239,26 @@ async function handleCompletions(req: http.IncomingMessage, res: http.ServerResp
     const originalModel = body.model;
     const originalToolNames = (body.tools ?? []).map((t: any) => t.function?.name).filter(Boolean);
 
+    // Capture chain-execution routing hints BEFORE mode application.
+    // applyModeToRequest() rebuilds the request body and may drop `metadata`,
+    // and a mode's `model.primary` would otherwise clobber an explicit
+    // per-request model pin. An explicit pin wins over a mode default.
+    const routingMetadata = body.metadata ? { ...body.metadata } : undefined;
+    const pinnedModel = routingMetadata?.model;
+
     // Apply mode overrides to the request body (model, tools, prompt, etc.).
     const agentPolicy: AgentToolPolicy = {};
     body = applyModeToRequest(resolution.mode, body as unknown as import('./modes/apply.js').RequestBody, agentPolicy) as unknown as RequestBody;
+
+    // Re-attach routing metadata after mode resolution, preserving an
+    // explicit model pin even when the mode set a different primary.
+    if (routingMetadata) {
+      body.metadata = { ...routingMetadata };
+      if (pinnedModel) {
+        body.metadata.model = pinnedModel;
+        body.model = 'auto';
+      }
+    }
 
     const appliedToolNames = (body.tools ?? []).map((t: any) => t.function?.name).filter(Boolean);
     const removedTools = originalToolNames.filter((n: string) => !appliedToolNames.includes(n));
