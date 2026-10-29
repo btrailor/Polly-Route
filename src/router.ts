@@ -35,12 +35,26 @@ export function decideTarget(
   vault: VaultSignal,
   contextFits: boolean,
   skill: SkillSignal = { hasSkill: false },
+  explicitCloud = false,
 ): RoutingTarget {
   // Skill coverage can fill a vault gap: if we have a matching skill we treat
   // ABSENT knowledge as ADJACENT, because the skill procedure provides enough
   // structured context for a local model to attempt the task.
   const effectiveVault: VaultSignal['confidence'] =
     vault.confidence === 'ABSENT' && skill.hasSkill ? 'ADJACENT' : vault.confidence;
+
+  // Explicit caller intent for the cloud tier outranks the inferred vault
+  // signal.
+  //
+  // The vault probe is a semantic heuristic: measured on 2026-10-29, a
+  // nonsense query ("zzz definitely not in vault qqq") scored 0.855 and
+  // classified as DIRECT, so the probe returned DIRECT for every request and
+  // the CLOUD branch was unreachable in practice. When a caller explicitly
+  // asks for the cloud tier, that intent must win over a heuristic that
+  // cannot currently tell "in the vault" from "not in the vault".
+  //
+  // This mirrors the precedence already used for model-over-tier.
+  if (explicitCloud) return 'CLOUD';
 
   switch (effectiveVault) {
     case 'DIRECT':
@@ -103,6 +117,37 @@ function resolveExactModel(
   };
 }
 
+/**
+ * Build a local-only chain: every local endpoint that fits, no cloud.
+ *
+ * Used when `metadata.localOnly` is set but the routing target resolved to
+ * CLOUD (for example because the caller also asked for the cloud tier). The
+ * constraint wins.
+ */
+function buildLocalOnlyChain(
+  ollama: OllamaAdapter,
+  llamacppAdapters: LlamacppAdapter[],
+  localBody: RequestBody,
+): ChainEntry[] {
+  const out: ChainEntry[] = [];
+  const localChars = estimateChars(localBody.messages);
+
+  for (const adapter of llamacppAdapters) {
+    const maxChars = adapter.maxChars();
+    if (maxChars > 0 && localChars > maxChars) continue;
+    out.push({ name: adapter.name, fn: () => adapter.dispatch(localBody) });
+  }
+
+  const model = ollama.pickModel(localChars);
+  if (model) {
+    const localChars2 = localChars;
+    if (ollama.fits(model, localChars2)) {
+      out.push({ name: `ollama/${model.id}`, fn: () => ollama.dispatch(model, localBody) });
+    }
+  }
+  return out;
+}
+
 export async function buildChain(
   body: RequestBody,
   complexity: Complexity,
@@ -135,18 +180,26 @@ export async function buildChain(
   // (light / medium / heavy) that would be dispatched for the complexity.
   let target: RoutingTarget;
   let localBody: RequestBody;
+
+  // Explicit caller intent for the cloud tier outranks the inferred vault
+  // signal. See the `explicitCloud` note below.
+  // `localOnly` is a HARD constraint ("never leave this machine"), so it
+  // overrides even an explicit `tier: 'cloud'`. Without this, the two hints
+  // contradict each other and the chain would silently reach the cloud.
+  const explicitCloud = body.metadata?.tier === 'cloud'
+    && body.metadata?.localOnly !== true;
   if (vault.confidence === 'DIRECT') {
     const fits = ollamaOk && pickLocalModel(ollama, complexity, body) !== null;
-    target = decideTarget(complexity, vault, fits, skill);
+    target = decideTarget(complexity, vault, fits, skill, explicitCloud);
     localBody = body;
   } else if (vault.confidence === 'ADJACENT') {
     if (complexity === 'LIGHT') {
       const fits = ollamaOk && pickLocalModel(ollama, complexity, body) !== null;
-      target = decideTarget(complexity, vault, fits, skill);
+      target = decideTarget(complexity, vault, fits, skill, explicitCloud);
       localBody = body;
     } else if (complexity === 'MEDIUM') {
       const fits = ollamaOk && pickLocalModel(ollama, complexity, enriched) !== null;
-      target = decideTarget(complexity, vault, fits, skill);
+      target = decideTarget(complexity, vault, fits, skill, explicitCloud);
       localBody = enriched;
     } else {
       target = 'CLOUD';
@@ -158,11 +211,11 @@ export async function buildChain(
       // skill procedure as injected context.
       if (complexity === 'LIGHT') {
         const fits = ollamaOk && pickLocalModel(ollama, complexity, body) !== null;
-        target = decideTarget(complexity, vault, fits, skill);
+        target = decideTarget(complexity, vault, fits, skill, explicitCloud);
         localBody = body;
       } else if (complexity === 'MEDIUM') {
         const fits = ollamaOk && pickLocalModel(ollama, complexity, enriched) !== null;
-        target = decideTarget(complexity, vault, fits, skill);
+        target = decideTarget(complexity, vault, fits, skill, explicitCloud);
         localBody = enriched;
       } else {
         target = 'CLOUD';
@@ -171,7 +224,7 @@ export async function buildChain(
     } else {
       if (complexity === 'LIGHT') {
         const fits = ollamaOk && pickLocalModel(ollama, complexity, body) !== null;
-        target = decideTarget(complexity, vault, fits, skill);
+        target = decideTarget(complexity, vault, fits, skill, explicitCloud);
         localBody = body;
       } else {
         target = 'CLOUD';
@@ -293,6 +346,7 @@ export async function buildChain(
   const requestedModel = routingMeta.model;
   const localOnly = routingMeta.localOnly === true;
 
+
   // An explicit tier/model pin also forces the local target, unless the
   // caller explicitly asked for the cloud tier.
   const tierForcesLocal = requestedModel !== undefined
@@ -384,6 +438,19 @@ export async function buildChain(
       chain.push({ name: 'copilot', fn: () => copilot(cloudBody) });
     }
   } else { // CLOUD
+    // `localOnly` is a hard constraint ("never leave this machine"). It
+    // overrides the cloud target, including one forced by an explicit
+    // `metadata.tier: 'cloud'`. Without this the two hints contradict each
+    // other and a chain step could silently reach a cloud provider.
+    if (localOnly) {
+      log('local-only-overrides-cloud-target', {
+        chainId: routingMeta.chainId,
+        chainStep: routingMeta.chainStep,
+      });
+      const forced = buildLocalOnlyChain(ollama, llamacppAdapters, localBody);
+      chain.push(...forced);
+      return { target: 'LOCAL', chain, confidenceEnabled: !!(config as any).confidence?.enabled };
+    }
     // Ollama Pro is the primary cloud target (preferred cloud tier).
     push('ollamapro',      ollamapro      ? () => ollamapro(cloudBody)      : null, p.ollamapro, cloudBody);
     // Direct API adapters — bypass OpenRouter intermediary

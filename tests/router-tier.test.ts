@@ -142,6 +142,34 @@ describe('router tier contract', () => {
     expect(names).toHaveLength(1);
   });
 
+  test('an explicit tier=cloud request reaches the CLOUD branch', async () => {
+    // The vault probe is a semantic heuristic that currently returns DIRECT
+    // for everything (measured 2026-10-29: a nonsense query scored 0.855
+    // and classified as DIRECT). An explicit caller request for the cloud
+    // tier must outrank that inferred signal.
+    const names = await chainNames(bodyWith({ tier: 'cloud' }));
+    const cloud = names.filter(n =>
+      ['ollamapro', 'kimi', 'glm', 'qwen', 'google', 'groq', 'deepseek',
+       'openrouter_free', 'mistral', 'cerebras', 'copilot', 'openrouter'].includes(n));
+    expect(cloud.length).toBeGreaterThan(0);
+    expect(names.some(n => n.startsWith('ollama/') || n.startsWith('llamacpp/'))).toBe(false);
+  });
+
+  test('an explicit tier=cloud request with localOnly strips cloud again', async () => {
+    // localOnly is a hard constraint: it must win even over an explicit
+    // cloud tier, because the caller is asserting "never leave this machine".
+    const names = await chainNames(bodyWith({ tier: 'cloud', localOnly: true }));
+    const cloud = names.filter(n =>
+      ['ollamapro', 'kimi', 'glm', 'qwen', 'google', 'groq', 'deepseek',
+       'openrouter_free', 'mistral', 'cerebras', 'copilot', 'openrouter'].includes(n));
+    expect(cloud.length).toBe(0);
+  });
+
+  test('an explicit tier=light still forces local', async () => {
+    const names = await chainNames(bodyWith({ tier: 'light' }));
+    expect(names.some(n => n.startsWith('ollama/') || n.startsWith('llamacpp/'))).toBe(true);
+  });
+
   test('chain id and step id survive into the plan for attribution', async () => {
     const names = await chainNames(bodyWith({
       tier: 'light', localOnly: true, chainId: 'story-idea', chainStep: 'decide_target',
