@@ -16,13 +16,19 @@
 import { afterAll } from '@jest/globals';
 import { mkdtempSync, rmSync } from 'fs';
 import { tmpdir } from 'os';
-import { join } from 'path';
+import { join, resolve } from 'path';
 
 const tmpRoot = mkdtempSync(join(tmpdir(), 'polly-router-test-'));
 
 process.env.POLLY_RELIABILITY_PATH = join(tmpRoot, 'persona-reliability.jsonl');
 process.env.POLLY_METRICS_PATH = join(tmpRoot, 'polly-metrics.jsonl');
 process.env.POLLY_VAULT_ROOT = join(tmpRoot, 'vault');
+
+// Point the modes loader at the tracked fixture instead of a developer's live
+// ~/.openclaw/modes.json. Without this the modes test suite depends on a file
+// that does not exist in CI or on a fresh checkout, and the tests fail with
+// "Cannot read properties of undefined" rather than testing anything.
+process.env.OPENCLAW_MODES_PATH = resolve(__dirname, 'fixtures/modes.json');
 
 afterAll(() => {
   try {

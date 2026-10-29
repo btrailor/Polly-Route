@@ -11,6 +11,7 @@ export type ModeId =
   | 'precise'
   | 'creative'
   | 'ops'
+  | 'syntaxis'
   | 'lockdown';
 
 export type RoutingTarget = 'auto' | 'local' | 'local-first' | 'best';
@@ -71,6 +72,7 @@ export const KNOWN_MODE_IDS: ModeId[] = [
   'precise',
   'creative',
   'ops',
+  'syntaxis',
   'lockdown',
 ];
 

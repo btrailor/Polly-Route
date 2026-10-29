@@ -8,7 +8,17 @@ const DEFAULT_CONFIG: ModesConfig = {
   modes: {},
 };
 
+/**
+ * Resolve the path to the modes config.
+ *
+ * `OPENCLAW_MODES_PATH` overrides the default location. This exists so tests
+ * (and CI) can run against a tracked fixture instead of depending on a
+ * developer's ~/.openclaw/modes.json — the modes test suite otherwise fails
+ * on any machine (or CI runner) where that file is absent.
+ */
 export function modesConfigPath(): string {
+  const override = process.env.OPENCLAW_MODES_PATH;
+  if (override && override.trim()) return override.trim();
   return path.join(process.env.HOME || '.', '.openclaw', 'modes.json');
 }
 

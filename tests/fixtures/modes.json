@@ -1,0 +1,256 @@
+{
+  "$schema": "https://openclaw.ai/schemas/modes.json#v1",
+  "version": 1,
+  "defaultMode": "default",
+  "modes": {
+    "default": {
+      "name": "Default",
+      "description": "Balanced assistance. No overrides; defers to agent and router defaults.",
+      "routing": {
+        "target": "auto",
+        "costBias": "balanced",
+        "localFirst": false
+      },
+      "model": {
+        "primary": null,
+        "fallbacks": null
+      },
+      "tools": {
+        "allow": null,
+        "deny": null,
+        "requireConfirmation": []
+      },
+      "prompt": {
+        "systemSuffix": null,
+        "temperature": null
+      },
+      "flags": {
+        "absolute": false,
+        "auditBeforeTool": false,
+        "disableWeb": false,
+        "disableSubagents": false,
+        "disableExec": false
+      }
+    },
+    "fast": {
+      "name": "Fast",
+      "description": "Low-latency, single-turn answers. Prefers small local / free cloud, stops at medium.",
+      "routing": {
+        "target": "local-first",
+        "costBias": "cheap",
+        "localFirst": true,
+        "maxComplexity": "MEDIUM"
+      },
+      "model": {
+        "primary": "ollama/qwen2.5:7b",
+        "fallbacks": [
+          "groq/llama-3.3-70b-versatile",
+          "google/gemini-2.5-flash"
+        ]
+      },
+      "tools": {
+        "allow": null,
+        "deny": [
+          "skill_workshop",
+          "workboard_create"
+        ],
+        "requireConfirmation": [
+          "exec",
+          "workboard_complete"
+        ]
+      },
+      "prompt": {
+        "systemSuffix": "Be concise. Prefer one-step answers. Ask before opening multi-step workflows.",
+        "temperature": 0.3
+      },
+      "flags": {
+        "absolute": false,
+        "auditBeforeTool": false,
+        "disableWeb": false,
+        "disableSubagents": true,
+        "disableExec": false
+      }
+    },
+    "precise": {
+      "name": "Precise",
+      "description": "High-accuracy, careful reasoning. Uses strongest available model; allows research and verification.",
+      "routing": {
+        "target": "best",
+        "costBias": "quality",
+        "localFirst": false
+      },
+      "model": {
+        "primary": "openrouter/qwen/qwen3-235b-a22b",
+        "fallbacks": [
+          "google/gemini-3.1-pro-preview",
+          "openrouter/deepseek/deepseek-chat-v3-0324"
+        ]
+      },
+      "tools": {
+        "allow": null,
+        "deny": [],
+        "requireConfirmation": [
+          "exec"
+        ]
+      },
+      "prompt": {
+        "systemSuffix": "You are in precise mode. Cite sources, state confidence, and distinguish facts from inference. Avoid shortcuts.",
+        "temperature": 0.2
+      },
+      "flags": {
+        "absolute": false,
+        "auditBeforeTool": true,
+        "disableWeb": false,
+        "disableSubagents": false,
+        "disableExec": false
+      }
+    },
+    "creative": {
+      "name": "Creative",
+      "description": "Generative, exploratory, less constrained. Enables web search and subagents for inspiration.",
+      "routing": {
+        "target": "best",
+        "costBias": "balanced",
+        "localFirst": false
+      },
+      "model": {
+        "primary": "google/gemini-3.1-pro-preview",
+        "fallbacks": [
+          "openrouter/deepseek/deepseek-chat-v3-0324",
+          "openrouter/anthropic/claude-sonnet-4"
+        ]
+      },
+      "tools": {
+        "allow": null,
+        "deny": [
+          "exec",
+          "process"
+        ],
+        "requireConfirmation": [
+          "exec",
+          "workboard_complete"
+        ]
+      },
+      "prompt": {
+        "systemSuffix": "You are in creative mode. Explore alternatives, generate options, and use web search for inspiration. Be vivid and concrete.",
+        "temperature": 0.8
+      },
+      "flags": {
+        "absolute": false,
+        "auditBeforeTool": false,
+        "disableWeb": false,
+        "disableSubagents": false,
+        "disableExec": true
+      }
+    },
+    "ops": {
+      "name": "Ops",
+      "description": "Local-only, filesystem-first, no cloud leakage. Runs code and config edits freely.",
+      "routing": {
+        "target": "local",
+        "costBias": "free",
+        "localFirst": true
+      },
+      "model": {
+        "primary": "ollama/qwen2.5-coder:32b",
+        "fallbacks": [
+          "ollama/qwen2.5:72b"
+        ]
+      },
+      "tools": {
+        "allow": null,
+        "deny": [
+          "web_search",
+          "web_fetch",
+          "browser"
+        ],
+        "requireConfirmation": []
+      },
+      "prompt": {
+        "systemSuffix": "You are in ops mode. Prefer local execution. Never send code or secrets to cloud providers. Log every shell command before running it.",
+        "temperature": 0.2
+      },
+      "flags": {
+        "absolute": false,
+        "auditBeforeTool": false,
+        "disableWeb": true,
+        "disableSubagents": true,
+        "disableExec": false
+      }
+    },
+    "syntaxis": {
+      "name": "Syntaxis",
+      "description": "Local-only agentic work with delegation allowed. For Syntaxis pipeline development \u2014 the conductor, domain packs, and the scripts they orchestrate. Routing is forced LOCAL with the cloud chain stripped, but subagents stay enabled so the work can still be fanned out.",
+      "routing": {
+        "target": "local",
+        "costBias": "free",
+        "localFirst": true
+      },
+      "model": {
+        "primary": "ollama/qwen2.5-coder:32b",
+        "fallbacks": [
+          "ollama/qwen2.5:72b"
+        ]
+      },
+      "tools": {
+        "allow": null,
+        "deny": [
+          "web_search",
+          "web_fetch",
+          "browser"
+        ],
+        "requireConfirmation": []
+      },
+      "prompt": {
+        "systemSuffix": "You are in Syntaxis mode. All inference is local \u2014 never route requests to a cloud model. The point of Syntaxis is to make small local models capable through script chaining, constrained action menus, and deterministic gates. Keep orchestration contexts small: the model selects an action, the scripts do the work. When a task is too large for one local context, decompose it into separately invokable workflows rather than enlarging the prompt.",
+        "temperature": 0.2
+      },
+      "flags": {
+        "absolute": true,
+        "auditBeforeTool": false,
+        "disableWeb": true,
+        "disableSubagents": false,
+        "disableExec": false
+      }
+    },
+    "lockdown": {
+      "name": "Lockdown",
+      "description": "Absolute local-only, no network tools, no subagents, no cloud models. Secrets-safe.",
+      "routing": {
+        "target": "local",
+        "costBias": "free",
+        "localFirst": true
+      },
+      "model": {
+        "primary": "ollama/qwen2.5-coder:32b",
+        "fallbacks": []
+      },
+      "tools": {
+        "allow": [
+          "read",
+          "edit",
+          "apply_patch",
+          "exec",
+          "process"
+        ],
+        "deny": null,
+        "requireConfirmation": [
+          "exec",
+          "process",
+          "apply_patch"
+        ]
+      },
+      "prompt": {
+        "systemSuffix": "You are in LOCKDOWN mode. Network, web, subagents, and cloud providers are disabled. Only local filesystem and shell operations are allowed. Never transmit request content outside this machine. Warn if asked to do so.",
+        "temperature": 0.2
+      },
+      "flags": {
+        "absolute": true,
+        "auditBeforeTool": true,
+        "disableWeb": true,
+        "disableSubagents": true,
+        "disableExec": false
+      }
+    }
+  }
+}

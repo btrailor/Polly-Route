@@ -146,10 +146,29 @@ export interface Config {
   };
 }
 
-const DEFAULT_OLLAMA_MODELS: OllamaModel[] = [
+/**
+ * Default local model roster.
+ *
+ * The heavy tier deliberately points at the 32B coder rather than a 72B model.
+ *
+ * Why: on a 64 GB unified-memory Mac, qwen2.5:72b is ~47.4 GB on disk and
+ * qwen2.5-coder:32b is ~19.9 GB. When both are resident the total (67.3 GB)
+ * exceeds physical RAM, the Ollama runner dies with
+ * `GGML_ASSERT([rsets->data count] == 0)`, and the router's fallback chain
+ * silently hands the request to a cloud provider (ollamapro/kimi-k2.7-code).
+ *
+ * The 32B is proven capable of the heavy tier — it produces correct, idiomatic
+ * code for realistic agentic tasks in ~24s. A 72B can still be used, but it
+ * must not be *demanded* while a smaller model is resident; put it in
+ * `config.json` as a cold fallback rather than in the default heavy slot.
+ *
+ * Duplicate ids are safe: OllamaAdapter.fits() and timeoutMsFor() both resolve
+ * by model id, so a repeated id behaves like a distinct weight class entry.
+ */
+export const DEFAULT_OLLAMA_MODELS: OllamaModel[] = [
   { id: 'qwen2.5:7b',        name: 'Qwen 2.5 7B',         maxChars:  28000, weight: 'light',  contextTokens: 32768 },
   { id: 'qwen2.5-coder:32b', name: 'Qwen 2.5 Coder 32B',  maxChars: 112000, weight: 'medium', contextTokens: 32768 },
-  { id: 'qwen2.5:72b',       name: 'Qwen 2.5 72B',        maxChars: 112000, weight: 'heavy',  contextTokens: 32768 },
+  { id: 'qwen2.5-coder:32b', name: 'Qwen 2.5 Coder 32B (heavy tier)', maxChars: 112000, weight: 'heavy', contextTokens: 32768 },
 ];
 
 // Provider ids that share a single secret file. The map key is the provider id
