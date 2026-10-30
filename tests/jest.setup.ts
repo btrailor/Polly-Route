@@ -16,7 +16,7 @@
 import { afterAll } from '@jest/globals';
 import { mkdtempSync, rmSync } from 'fs';
 import { tmpdir } from 'os';
-import { join, resolve } from 'path';
+import { join } from 'path';
 
 const tmpRoot = mkdtempSync(join(tmpdir(), 'polly-router-test-'));
 
@@ -24,11 +24,13 @@ process.env.POLLY_RELIABILITY_PATH = join(tmpRoot, 'persona-reliability.jsonl');
 process.env.POLLY_METRICS_PATH = join(tmpRoot, 'polly-metrics.jsonl');
 process.env.POLLY_VAULT_ROOT = join(tmpRoot, 'vault');
 
-// Point the modes loader at the tracked fixture instead of a developer's live
-// ~/.openclaw/modes.json. Without this the modes test suite depends on a file
-// that does not exist in CI or on a fresh checkout, and the tests fail with
-// "Cannot read properties of undefined" rather than testing anything.
-process.env.OPENCLAW_MODES_PATH = resolve(__dirname, 'fixtures/modes.json');
+// The modes loader resolves the repo's tracked modes.json (and falls back to
+// ~/.openclaw/modes.json). No override is needed here: pointing tests at a
+// separate fixture would create a second copy of the mode definitions that
+// can drift from the canonical file. Leaving it unset also exercises the real
+// resolution path, so a broken lookup fails the suite instead of passing
+// against a fixture.
+delete process.env.OPENCLAW_MODES_PATH;
 
 afterAll(() => {
   try {

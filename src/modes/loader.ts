@@ -11,14 +11,27 @@ const DEFAULT_CONFIG: ModesConfig = {
 /**
  * Resolve the path to the modes config.
  *
- * `OPENCLAW_MODES_PATH` overrides the default location. This exists so tests
- * (and CI) can run against a tracked fixture instead of depending on a
- * developer's ~/.openclaw/modes.json — the modes test suite otherwise fails
- * on any machine (or CI runner) where that file is absent.
+ * Resolution order:
+ *   1. `OPENCLAW_MODES_PATH` — explicit override. Used by tests and CI.
+ *   2. The repo's tracked `modes.json` — the canonical, version-controlled
+ *      source of truth.
+ *   3. `~/.openclaw/modes.json` — legacy per-machine location, still honored
+ *      so an existing setup keeps working unchanged.
+ *
+ * The repo copy wins so that the mode definitions (including the local-first
+ * `syntaxis` mode) are version-controlled and travel with the code. The
+ * `__dirname` math resolves to the repo root from both `src/modes/` and
+ * `dist/modes/`, so the same file is found whether running from source or
+ * from the compiled build.
  */
 export function modesConfigPath(): string {
   const override = process.env.OPENCLAW_MODES_PATH;
   if (override && override.trim()) return override.trim();
+
+  const repoRoot = path.resolve(__dirname, '..', '..');
+  const tracked = path.join(repoRoot, 'modes.json');
+  if (fs.existsSync(tracked)) return tracked;
+
   return path.join(process.env.HOME || '.', '.openclaw', 'modes.json');
 }
 

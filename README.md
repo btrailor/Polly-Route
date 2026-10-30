@@ -133,6 +133,35 @@ User Request
 6. **Ollama Pro** (paid) — Cloud Ollama, premium fallback
 7. **GitHub Copilot** (paid) — Claude Sonnet, Opus
 
+### Modes
+
+`modes.json` holds the mode definitions. It is **tracked in this repo** and is the
+canonical source — the router prefers it over `~/.openclaw/modes.json`, so the mode
+definitions travel with the code and are reviewed like any other source file.
+
+Resolution order:
+1. `OPENCLAW_MODES_PATH` — explicit override (used by tests)
+2. `modes.json` in the repo root — the tracked, canonical copy
+3. `~/.openclaw/modes.json` — legacy per-machine location, still honored
+
+| Mode | Routing | Subagents | Purpose |
+|------|---------|-----------|---------|
+| `default` | auto | yes | Balanced; defers to agent and router defaults |
+| `fast` | local-first | no | Low-latency single turns, capped at MEDIUM complexity |
+| `precise` | best | yes | High-accuracy reasoning, research and verification allowed |
+| `creative` | best | yes | Generative and exploratory, web search enabled |
+| `ops` | local | no | Local-only filesystem and config work, no cloud leakage |
+| `syntaxis` | **local (absolute)** | **yes** | Local-only *with* delegation — for Syntaxis pipeline work |
+| `lockdown` | local (absolute) | no | Absolute local-only, no network tools, no cloud models |
+
+The `absolute` flag is what strips the cloud fallback chain entirely: when it is set,
+`forceLocal` in `router.ts` removes the cloud providers from the chain, so a local
+failure can never be silently absorbed by a cloud provider.
+
+`syntaxis` exists because `ops` and `lockdown` both disable subagents, which makes them
+unusable for pipeline work that fans out across agents. `syntaxis` is local-absolute for
+*routing* while still permitting delegation.
+
 ---
 
 ## Conductor Domain Probes

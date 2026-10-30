@@ -252,5 +252,6 @@
         "disableExec": false
       }
     }
-  }
+  },
+  "_comment": "Canonical mode definitions for Polly Router. This file is version-controlled; the router prefers it over ~/.openclaw/modes.json. Set OPENCLAW_MODES_PATH to point at a different file (used by tests and CI)."
 }
